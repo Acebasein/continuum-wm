@@ -98,3 +98,8 @@ pub fn capture_focused_workspace() -> Result<Snapshot, Box<dyn Error>> {
         },
     })
 }
+pub fn live_window_ids() -> Result<Vec<u64>, Box<dyn Error>> {
+    let windows: Vec<NiriWindow> = query_niri("windows")?;
+
+    Ok(windows.into_iter().map(|window| window.id).collect())
+}
