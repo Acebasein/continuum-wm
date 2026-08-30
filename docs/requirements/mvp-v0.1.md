@@ -351,7 +351,7 @@ feasibility.
 | MVP 1 — Persistence | ✅ Passed |
 | MVP 2 — Live-State Reconciliation | ✅ Passed |
 | MVP 3 — Launch |  ✅ Passed   |
-| MVP 4 — Matching | Not started |
+| MVP 4 — Matching |  ✅ Passed  |
 | MVP 5 — Placement | Not started |
 | MVP 6 — Layout | Not started |
 | MVP 7 — Real Session Test | Not started |
