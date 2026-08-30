@@ -1,13 +1,13 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Snapshot {
     pub schema_version: u32,
     pub captured_at_unix_ms: u64,
     pub workspace: WorkspaceSnapshot,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WorkspaceSnapshot {
     pub runtime_id: u64,
     pub index: u64,
@@ -16,7 +16,7 @@ pub struct WorkspaceSnapshot {
     pub windows: Vec<WindowSnapshot>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WindowSnapshot {
     pub runtime_id: u64,
     pub app_id: Option<String>,
@@ -28,7 +28,7 @@ pub struct WindowSnapshot {
     pub layout: Option<LayoutSnapshot>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LayoutSnapshot {
     pub scrolling_position: Option<[i64; 2]>,
     pub tile_size: Option<[f64; 2]>,

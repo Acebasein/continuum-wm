@@ -348,7 +348,7 @@ feasibility.
 | Stage | Status |
 |---|---|
 | MVP 0 — Snapshot | ✅ Passed |
-| MVP 1 — Persistence | Not started |
+| MVP 1 — Persistence | ✅ Passed |
 | MVP 2 — Live-State Reconciliation | Not started |
 | MVP 3 — Launch | Not started |
 | MVP 4 — Matching | Not started |
