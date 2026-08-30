@@ -342,3 +342,16 @@ session restoration test.
 Research discovered during MVP development should be recorded, but new
 features should not be added unless they are required to determine MVP
 feasibility.
+
+## MVP Progress
+
+| Stage | Status |
+|---|---|
+| MVP 0 — Snapshot | ✅ Passed |
+| MVP 1 — Persistence | Not started |
+| MVP 2 — Live-State Reconciliation | Not started |
+| MVP 3 — Launch | Not started |
+| MVP 4 — Matching | Not started |
+| MVP 5 — Placement | Not started |
+| MVP 6 — Layout | Not started |
+| MVP 7 — Real Session Test | Not started |
