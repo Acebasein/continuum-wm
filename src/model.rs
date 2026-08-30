@@ -25,14 +25,18 @@ pub struct WindowSnapshot {
     pub workspace_runtime_id: Option<u64>,
     pub is_focused: bool,
     pub is_floating: bool,
-    pub layout: Option<LayoutSnapshot>,
+
+    #[serde(default)]
+    pub launch_command: Option<Vec<String>>,
+
+    pub layout: LayoutSnapshot,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LayoutSnapshot {
-    pub scrolling_position: Option<[i64; 2]>,
-    pub tile_size: Option<[f64; 2]>,
-    pub window_size: Option<[i64; 2]>,
+    pub scrolling_position: Option<[u32; 2]>,
+    pub tile_size: [f64; 2],
+    pub window_size: [i32; 2],
     pub workspace_view_position: Option<[f64; 2]>,
-    pub window_offset_in_tile: Option<[f64; 2]>,
+    pub window_offset_in_tile: [f64; 2],
 }
