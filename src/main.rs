@@ -106,7 +106,7 @@ fn print_usage() {
     println!("  load                        Load and validate the saved snapshot");
     println!("  reconcile                   Compare saved snapshot with live state");
     println!("  launch <runtime-id>         Launch one missing saved window");
-    println!("  launch-match <runtime-id>   Launch, match, and optionally place");
+    println!("  launch-match <runtime-id>   Launch, match, place, size, and order");
     println!("  observe-match <app-id>      Observe matching candidates without launch");
     println!("  place <window-id> <index>   Move one exact Niri window to a workspace");
 }
@@ -191,7 +191,7 @@ fn reconcile() -> Result<(), Box<dyn Error>> {
 
 fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
     let heading = if observe_match {
-        "Continuum-WM MVP 5 — Launch + Match + Placement"
+        "Continuum-WM MVP 6 — Launch + Match + Layout"
     } else {
         "Continuum-WM MVP 3 — Launch"
     };
@@ -245,6 +245,17 @@ fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
     );
     println!("  saved runtime ID: {}", saved_window.runtime_id);
     println!("  target workspace index: {}", saved.workspace.index);
+
+    if let Some([column, row]) = saved_window.layout.scrolling_position {
+        println!("  saved scrolling position: [{column},{row}]");
+    } else {
+        println!("  saved scrolling position: <none>");
+    }
+
+    println!(
+        "  saved window size: {} × {}",
+        saved_window.layout.window_size[0], saved_window.layout.window_size[1]
+    );
     println!();
 
     println!("Captured launch argv:");
@@ -280,11 +291,11 @@ fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
         println!("  2. observe newly created Niri windows");
         println!("  3. classify the result conservatively");
         println!();
-        println!("Placement is NOT automatic.");
-        println!("A uniquely matched window requires a second confirmation before moving.");
+        println!("Layout restoration is NOT automatic.");
+        println!("A uniquely matched window requires a second confirmation.");
     } else {
         println!("This action will only start the captured process.");
-        println!("No matching or placement will be performed.");
+        println!("No matching or layout restoration will be performed.");
     }
 
     println!();
@@ -320,9 +331,11 @@ fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
             matching::classify_candidates(candidates),
             expected_app_id,
             saved.workspace.index,
+            saved_window.layout.window_size,
+            saved_window.layout.scrolling_position,
         )?;
     } else {
-        println!("No window matching or placement was attempted.");
+        println!("No window matching or layout restoration was attempted.");
     }
 
     Ok(())
@@ -332,6 +345,8 @@ fn handle_launch_match_result(
     result: MatchResult,
     expected_app_id: &str,
     target_workspace_index: u64,
+    saved_window_size: [i32; 2],
+    saved_position: Option<[u32; 2]>,
 ) -> Result<(), Box<dyn Error>> {
     match result {
         MatchResult::Matched(window) => {
@@ -352,44 +367,54 @@ fn handle_launch_match_result(
                     .map(|pid| pid.to_string())
                     .unwrap_or_else(|| "<unknown>".to_string())
             );
-            println!(
-                "  current workspace runtime ID: {}",
-                window
-                    .workspace_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string())
-            );
-            println!();
-            println!("Placement candidate:");
-            println!("  exact matched window ID: {}", window.id);
-            println!("  target saved workspace index: {target_workspace_index}");
-            println!();
-            println!("Only this exact newly matched runtime window may be moved.");
-            println!("No layout, sizing, ordering, or focus restoration will occur.");
             println!();
 
-            print!(
-                "Move matched window {} to workspace index {}? [y/N]: ",
-                window.id, target_workspace_index
+            println!("Restoration candidate:");
+            println!("  exact matched window ID: {}", window.id);
+            println!("  target saved workspace index: {target_workspace_index}");
+            println!(
+                "  target saved window size: {} × {}",
+                saved_window_size[0], saved_window_size[1]
             );
+
+            if let Some([column, row]) = saved_position {
+                println!("  target saved scrolling position: [{column},{row}]");
+            }
+
+            println!();
+            println!("Only this exact newly matched runtime window may be changed.");
+            println!("Width and height use exact-window Niri actions.");
+            println!("Column restoration is attempted only after safety checks.");
+            println!();
+
+            print!("Restore matched window {}? [y/N]: ", window.id);
             io::stdout().flush()?;
 
             let mut answer = String::new();
             io::stdin().read_line(&mut answer)?;
 
             if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                println!("Placement cancelled.");
+                println!("Restoration cancelled.");
                 println!("The matched window was left untouched.");
                 return Ok(());
             }
 
             niri::move_window_to_workspace(window.id, target_workspace_index)?;
 
-            println!();
             println!(
-                "PLACED: matched Niri window {} was moved to workspace index {}.",
+                "PLACED: matched Niri window {} moved to workspace index {}.",
                 window.id, target_workspace_index
             );
+
+            niri::set_window_width(window.id, saved_window_size[0])?;
+            niri::set_window_height(window.id, saved_window_size[1])?;
+
+            println!(
+                "SIZE RESTORED: Niri window {} requested at {} × {}.",
+                window.id, saved_window_size[0], saved_window_size[1]
+            );
+
+            restore_saved_column(window.id, saved_position)?;
         }
         MatchResult::Ambiguous(windows) => {
             println!("AMBIGUOUS");
@@ -412,7 +437,7 @@ fn handle_launch_match_result(
 
             println!();
             println!("Continuum refused to select a window.");
-            println!("PLACEMENT BLOCKED.");
+            println!("LAYOUT RESTORATION BLOCKED.");
             println!("No desktop manipulation was attempted.");
         }
         MatchResult::NoMatch => {
@@ -420,9 +445,83 @@ fn handle_launch_match_result(
             println!(
                 "No new window with app_id {expected_app_id:?} appeared during the observation window."
             );
-            println!("PLACEMENT BLOCKED.");
+            println!("LAYOUT RESTORATION BLOCKED.");
             println!("No desktop manipulation was attempted.");
         }
+    }
+
+    Ok(())
+}
+
+fn restore_saved_column(
+    window_id: u64,
+    saved_position: Option<[u32; 2]>,
+) -> Result<(), Box<dyn Error>> {
+    let Some([saved_column, saved_row]) = saved_position else {
+        println!("COLUMN RESTORE SKIPPED: saved window has no scrolling position.");
+        return Ok(());
+    };
+
+    if saved_row != 1 {
+        println!(
+            "COLUMN RESTORE SKIPPED: saved position [{saved_column},{saved_row}] uses a multi-row layout."
+        );
+        println!("MVP 6.2 restores only single-window-column positions.");
+        return Ok(());
+    }
+
+    if !niri::window_is_alone_in_column(window_id)? {
+        println!(
+            "COLUMN RESTORE BLOCKED: Niri window {window_id} currently shares its column with another window."
+        );
+        println!("Continuum will not move a column containing unrelated live windows.");
+        return Ok(());
+    }
+
+    let previous_focus = niri::focused_window_id()?;
+
+    println!("COLUMN RESTORE: moving Niri window {window_id} to saved column {saved_column}.");
+
+    niri::focus_window(window_id)?;
+
+    let move_result = niri::move_focused_column_to_index(saved_column);
+
+    if let Some(previous_focus_id) = previous_focus
+        && previous_focus_id != window_id
+        && let Err(error) = niri::focus_window(previous_focus_id)
+    {
+        eprintln!(
+            "WARNING: failed to restore previous focus to window {previous_focus_id}: {error}"
+        );
+    }
+
+    move_result?;
+
+    let restored = niri::window_by_id(window_id)?
+        .ok_or_else(|| format!("Niri window {window_id} disappeared during column restoration"))?;
+
+    let restored_position = restored.layout.pos_in_scrolling_layout.ok_or_else(|| {
+        format!("Niri window {window_id} has no scrolling position after restore")
+    })?;
+
+    if restored_position[0] != saved_column {
+        return Err(format!(
+            "Column verification failed for Niri window {window_id}: expected column {saved_column}, got {}",
+            restored_position[0]
+        )
+        .into());
+    }
+
+    println!(
+        "COLUMN RESTORED: Niri window {window_id} verified at column {}.",
+        restored_position[0]
+    );
+
+    if restored_position[1] == saved_row {
+        println!(
+            "POSITION VERIFIED: Niri reports [{},{}].",
+            restored_position[0], restored_position[1]
+        );
     }
 
     Ok(())

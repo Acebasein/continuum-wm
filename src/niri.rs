@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -77,13 +78,13 @@ impl EventStream {
 
     pub fn collect_new_windows(
         &mut self,
-        baseline_ids: &std::collections::HashSet<u64>,
+        baseline_ids: &HashSet<u64>,
         expected_app_id: &str,
         timeout: Duration,
     ) -> Result<Vec<NiriWindow>, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         let mut matches = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_ids = HashSet::new();
 
         while let Some(value) = self.read_event_until(deadline)? {
             if let Some(window) = parse_window_opened_or_changed(&value)? {
@@ -229,6 +230,21 @@ where
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+fn run_niri_action(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("niri")
+        .arg("msg")
+        .arg("action")
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Niri action failed: {}", stderr.trim()).into());
+    }
+
+    Ok(())
+}
+
 fn read_launch_command(pid: u32) -> Option<Vec<String>> {
     let path = format!("/proc/{pid}/cmdline");
     let bytes = fs::read(path).ok()?;
@@ -321,37 +337,109 @@ pub fn capture_focused_workspace() -> Result<Snapshot, Box<dyn Error>> {
 
 pub fn live_window_ids() -> Result<Vec<u64>, Box<dyn Error>> {
     let windows: Vec<NiriWindow> = query_niri("windows")?;
-
     Ok(windows.into_iter().map(|window| window.id).collect())
 }
+
+pub fn focused_window_id() -> Result<Option<u64>, Box<dyn Error>> {
+    let windows: Vec<NiriWindow> = query_niri("windows")?;
+
+    Ok(windows
+        .into_iter()
+        .find(|window| window.is_focused)
+        .map(|window| window.id))
+}
+
+pub fn window_by_id(window_id: u64) -> Result<Option<NiriWindow>, Box<dyn Error>> {
+    let windows: Vec<NiriWindow> = query_niri("windows")?;
+
+    Ok(windows.into_iter().find(|window| window.id == window_id))
+}
+
+pub fn window_is_alone_in_column(window_id: u64) -> Result<bool, Box<dyn Error>> {
+    let windows: Vec<NiriWindow> = query_niri("windows")?;
+
+    let target = windows
+        .iter()
+        .find(|window| window.id == window_id)
+        .ok_or_else(|| format!("Niri window {window_id} was not found"))?;
+
+    let workspace_id = target
+        .workspace_id
+        .ok_or_else(|| format!("Niri window {window_id} has no workspace"))?;
+
+    let [column, _row] = target
+        .layout
+        .pos_in_scrolling_layout
+        .ok_or_else(|| format!("Niri window {window_id} has no scrolling-layout position"))?;
+
+    let count = windows
+        .iter()
+        .filter(|window| {
+            window.workspace_id == Some(workspace_id)
+                && window
+                    .layout
+                    .pos_in_scrolling_layout
+                    .is_some_and(|[candidate_column, _]| candidate_column == column)
+        })
+        .count();
+
+    Ok(count == 1)
+}
+
 pub fn move_window_to_workspace(
     window_id: u64,
     workspace_index: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let output = Command::new("niri")
-        .args([
-            "msg",
-            "action",
-            "move-window-to-workspace",
-            "--window-id",
-            &window_id.to_string(),
-            "--focus",
-            "false",
-            &workspace_index.to_string(),
-        ])
-        .output()?;
+    run_niri_action(&[
+        "move-window-to-workspace".to_string(),
+        "--window-id".to_string(),
+        window_id.to_string(),
+        "--focus".to_string(),
+        "false".to_string(),
+        workspace_index.to_string(),
+    ])
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        return Err(format!(
-            "Failed to move Niri window {window_id} to workspace {workspace_index}: {}",
-            stderr.trim()
-        )
-        .into());
+pub fn set_window_width(window_id: u64, width: i32) -> Result<(), Box<dyn Error>> {
+    if width <= 0 {
+        return Err(format!("Refusing to set invalid window width {width}").into());
     }
 
-    Ok(())
+    run_niri_action(&[
+        "set-window-width".to_string(),
+        "--id".to_string(),
+        window_id.to_string(),
+        width.to_string(),
+    ])
+}
+
+pub fn set_window_height(window_id: u64, height: i32) -> Result<(), Box<dyn Error>> {
+    if height <= 0 {
+        return Err(format!("Refusing to set invalid window height {height}").into());
+    }
+
+    run_niri_action(&[
+        "set-window-height".to_string(),
+        "--id".to_string(),
+        window_id.to_string(),
+        height.to_string(),
+    ])
+}
+
+pub fn focus_window(window_id: u64) -> Result<(), Box<dyn Error>> {
+    run_niri_action(&[
+        "focus-window".to_string(),
+        "--id".to_string(),
+        window_id.to_string(),
+    ])
+}
+
+pub fn move_focused_column_to_index(column_index: u32) -> Result<(), Box<dyn Error>> {
+    if column_index == 0 {
+        return Err("Refusing to move a column to index 0".into());
+    }
+
+    run_niri_action(&["move-column-to-index".to_string(), column_index.to_string()])
 }
 
 #[cfg(test)]
