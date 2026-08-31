@@ -324,6 +324,35 @@ pub fn live_window_ids() -> Result<Vec<u64>, Box<dyn Error>> {
 
     Ok(windows.into_iter().map(|window| window.id).collect())
 }
+pub fn move_window_to_workspace(
+    window_id: u64,
+    workspace_index: u64,
+) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("niri")
+        .args([
+            "msg",
+            "action",
+            "move-window-to-workspace",
+            "--window-id",
+            &window_id.to_string(),
+            "--focus",
+            "false",
+            &workspace_index.to_string(),
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        return Err(format!(
+            "Failed to move Niri window {window_id} to workspace {workspace_index}: {}",
+            stderr.trim()
+        )
+        .into());
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

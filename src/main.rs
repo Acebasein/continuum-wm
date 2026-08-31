@@ -14,7 +14,8 @@ use std::time::Duration;
 use matching::MatchResult;
 use reconcile::WindowStatus;
 
-const MATCH_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const LAUNCH_MATCH_TIMEOUT: Duration = Duration::from_secs(5);
+const MANUAL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
@@ -52,6 +53,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             observe_match(&app_id)
         }
+        Some("place") => {
+            let window_id = parse_required_u64(
+                args.next(),
+                "Missing Niri window ID",
+                "Window ID must be an unsigned integer",
+            )?;
+
+            let workspace_index = parse_required_u64(
+                args.next(),
+                "Missing workspace index",
+                "Workspace index must be an unsigned integer",
+            )?;
+
+            if args.next().is_some() {
+                return Err("Usage: continuum-wm place <window-id> <workspace-index>".into());
+            }
+
+            place(window_id, workspace_index)
+        }
         Some(command) => Err(format!("Unknown command: {command}").into()),
         None => {
             print_usage();
@@ -61,13 +81,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_runtime_id(value: Option<String>) -> Result<u64, Box<dyn Error>> {
+    parse_required_u64(
+        value,
+        "Missing saved runtime ID",
+        "Saved runtime ID must be an unsigned integer",
+    )
+}
+
+fn parse_required_u64(
+    value: Option<String>,
+    missing_message: &'static str,
+    invalid_message: &'static str,
+) -> Result<u64, Box<dyn Error>> {
     value
-        .ok_or_else(|| "Missing saved runtime ID".into())
-        .and_then(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|_| "Saved runtime ID must be an unsigned integer".into())
-        })
+        .ok_or_else(|| missing_message.into())
+        .and_then(|value| value.parse::<u64>().map_err(|_| invalid_message.into()))
 }
 
 fn print_usage() {
@@ -78,8 +106,9 @@ fn print_usage() {
     println!("  load                        Load and validate the saved snapshot");
     println!("  reconcile                   Compare saved snapshot with live state");
     println!("  launch <runtime-id>         Launch one missing saved window");
-    println!("  launch-match <runtime-id>   Launch and observe matching candidates");
+    println!("  launch-match <runtime-id>   Launch, match, and optionally place");
     println!("  observe-match <app-id>      Observe matching candidates without launch");
+    println!("  place <window-id> <index>   Move one exact Niri window to a workspace");
 }
 
 fn capture() -> Result<(), Box<dyn Error>> {
@@ -162,7 +191,7 @@ fn reconcile() -> Result<(), Box<dyn Error>> {
 
 fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
     let heading = if observe_match {
-        "Continuum-WM MVP 4 — Launch + Match Observation"
+        "Continuum-WM MVP 5 — Launch + Match + Placement"
     } else {
         "Continuum-WM MVP 3 — Launch"
     };
@@ -215,6 +244,7 @@ fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
         saved_window.title.as_deref().unwrap_or("<untitled>")
     );
     println!("  saved runtime ID: {}", saved_window.runtime_id);
+    println!("  target workspace index: {}", saved.workspace.index);
     println!();
 
     println!("Captured launch argv:");
@@ -243,14 +273,18 @@ fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
     };
 
     println!();
-    println!("This action will only start the captured process.");
-    println!("No placement or desktop manipulation will be performed.");
 
     if observe_match {
-        println!(
-            "Continuum will observe new Niri windows for {} seconds after launch.",
-            MATCH_OBSERVATION_TIMEOUT.as_secs()
-        );
+        println!("This action will:");
+        println!("  1. start the exact captured process");
+        println!("  2. observe newly created Niri windows");
+        println!("  3. classify the result conservatively");
+        println!();
+        println!("Placement is NOT automatic.");
+        println!("A uniquely matched window requires a second confirmation before moving.");
+    } else {
+        println!("This action will only start the captured process.");
+        println!("No matching or placement will be performed.");
     }
 
     println!();
@@ -272,16 +306,123 @@ fn launch(runtime_id: u64, observe_match: bool) -> Result<(), Box<dyn Error>> {
     println!("Process started with PID {}.", child.id());
 
     if let Some((stream, baseline_ids)) = event_stream.as_mut() {
-        println!("Observing matching candidates...");
+        println!(
+            "Observing matching candidates for {} seconds...",
+            LAUNCH_MATCH_TIMEOUT.as_secs()
+        );
 
         let candidates =
-            stream.collect_new_windows(baseline_ids, expected_app_id, MATCH_OBSERVATION_TIMEOUT)?;
+            stream.collect_new_windows(baseline_ids, expected_app_id, LAUNCH_MATCH_TIMEOUT)?;
 
         println!();
 
-        print_match_result(matching::classify_candidates(candidates), expected_app_id);
+        handle_launch_match_result(
+            matching::classify_candidates(candidates),
+            expected_app_id,
+            saved.workspace.index,
+        )?;
     } else {
         println!("No window matching or placement was attempted.");
+    }
+
+    Ok(())
+}
+
+fn handle_launch_match_result(
+    result: MatchResult,
+    expected_app_id: &str,
+    target_workspace_index: u64,
+) -> Result<(), Box<dyn Error>> {
+    match result {
+        MatchResult::Matched(window) => {
+            println!("MATCHED");
+            println!("  new runtime ID: {}", window.id);
+            println!(
+                "  app_id: {}",
+                window.app_id.as_deref().unwrap_or("<unknown>")
+            );
+            println!(
+                "  title: {}",
+                window.title.as_deref().unwrap_or("<untitled>")
+            );
+            println!(
+                "  PID: {}",
+                window
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            );
+            println!(
+                "  current workspace runtime ID: {}",
+                window
+                    .workspace_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            );
+            println!();
+            println!("Placement candidate:");
+            println!("  exact matched window ID: {}", window.id);
+            println!("  target saved workspace index: {target_workspace_index}");
+            println!();
+            println!("Only this exact newly matched runtime window may be moved.");
+            println!("No layout, sizing, ordering, or focus restoration will occur.");
+            println!();
+
+            print!(
+                "Move matched window {} to workspace index {}? [y/N]: ",
+                window.id, target_workspace_index
+            );
+            io::stdout().flush()?;
+
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("Placement cancelled.");
+                println!("The matched window was left untouched.");
+                return Ok(());
+            }
+
+            niri::move_window_to_workspace(window.id, target_workspace_index)?;
+
+            println!();
+            println!(
+                "PLACED: matched Niri window {} was moved to workspace index {}.",
+                window.id, target_workspace_index
+            );
+        }
+        MatchResult::Ambiguous(windows) => {
+            println!("AMBIGUOUS");
+            println!(
+                "{} new windows matched app_id {expected_app_id:?}:",
+                windows.len()
+            );
+
+            for window in windows {
+                println!(
+                    "  runtime={} pid={} title={}",
+                    window.id,
+                    window
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    window.title.as_deref().unwrap_or("<untitled>")
+                );
+            }
+
+            println!();
+            println!("Continuum refused to select a window.");
+            println!("PLACEMENT BLOCKED.");
+            println!("No desktop manipulation was attempted.");
+        }
+        MatchResult::NoMatch => {
+            println!("NO MATCH");
+            println!(
+                "No new window with app_id {expected_app_id:?} appeared during the observation window."
+            );
+            println!("PLACEMENT BLOCKED.");
+            println!("No desktop manipulation was attempted.");
+        }
     }
 
     Ok(())
@@ -309,15 +450,45 @@ fn observe_match(expected_app_id: &str) -> Result<(), Box<dyn Error>> {
 
     println!(
         "Observing new Niri windows for {} seconds...",
-        MATCH_OBSERVATION_TIMEOUT.as_secs()
+        MANUAL_OBSERVATION_TIMEOUT.as_secs()
     );
 
     let candidates =
-        stream.collect_new_windows(&baseline_ids, expected_app_id, MATCH_OBSERVATION_TIMEOUT)?;
+        stream.collect_new_windows(&baseline_ids, expected_app_id, MANUAL_OBSERVATION_TIMEOUT)?;
 
     println!();
 
     print_match_result(matching::classify_candidates(candidates), expected_app_id);
+
+    Ok(())
+}
+
+fn place(window_id: u64, workspace_index: u64) -> Result<(), Box<dyn Error>> {
+    println!("Continuum-WM MVP 5 — Placement Diagnostic");
+    println!();
+    println!("Window runtime ID: {window_id}");
+    println!("Target workspace index: {workspace_index}");
+    println!();
+    println!("This action WILL move exactly one Niri window.");
+    println!("Window focus will not follow the move.");
+    println!("No other placement or layout changes will be made.");
+    println!();
+
+    print!("Move this window? [y/N]: ");
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Placement cancelled.");
+        return Ok(());
+    }
+
+    niri::move_window_to_workspace(window_id, workspace_index)?;
+
+    println!();
+    println!("Requested move of Niri window {window_id} to workspace index {workspace_index}.");
 
     Ok(())
 }
@@ -343,6 +514,7 @@ fn print_match_result(result: MatchResult, expected_app_id: &str) {
                     .unwrap_or_else(|| "<unknown>".to_string())
             );
             println!();
+            println!("Diagnostic only.");
             println!("No placement or desktop manipulation was attempted.");
         }
         MatchResult::Ambiguous(windows) => {
