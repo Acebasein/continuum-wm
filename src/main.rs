@@ -1,8 +1,10 @@
+// Continuum-WM CLI with mixed-terminal capture/restore test commands
 mod matching;
 mod model;
 mod niri;
 mod reconcile;
 mod snapshot;
+mod terminal_restore;
 
 use std::collections::HashSet;
 use std::env;
@@ -52,6 +54,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             observe_match(&app_id)
+        }
+        Some("terminal-capture-test") => {
+            if args.next().is_some() {
+                return Err("Usage: continuum-wm terminal-capture-test".into());
+            }
+
+            terminal_restore::capture()
+        }
+        Some("terminal-restore-test") => {
+            if args.next().is_some() {
+                return Err("Usage: continuum-wm terminal-restore-test".into());
+            }
+
+            terminal_restore::run()
         }
         Some("place") => {
             let window_id = parse_required_u64(
@@ -109,6 +125,8 @@ fn print_usage() {
     println!("  launch-match <runtime-id>   Launch, match, place, size, and order");
     println!("  observe-match <app-id>      Observe matching candidates without launch");
     println!("  place <window-id> <index>   Move one exact Niri window to a workspace");
+    println!("  terminal-capture-test       Auto-capture live terminal continuity state");
+    println!("  terminal-restore-test       Restore the captured terminal continuity state");
 }
 
 fn capture() -> Result<(), Box<dyn Error>> {

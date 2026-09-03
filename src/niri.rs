@@ -105,6 +105,26 @@ impl EventStream {
         Ok(matches)
     }
 
+    pub fn wait_for_first_new_window(
+        &mut self,
+        baseline_ids: &HashSet<u64>,
+        expected_app_id: &str,
+    ) -> Result<NiriWindow, Box<dyn Error>> {
+        loop {
+            let value = self.read_event()?;
+
+            if let Some(window) = parse_window_opened_or_changed(&value)? {
+                if baseline_ids.contains(&window.id) {
+                    continue;
+                }
+
+                if window.app_id.as_deref() == Some(expected_app_id) {
+                    return Ok(window);
+                }
+            }
+        }
+    }
+
     fn read_event(&mut self) -> Result<Value, Box<dyn Error>> {
         let mut line = String::new();
         let bytes_read = self.reader.read_line(&mut line)?;
@@ -353,6 +373,27 @@ pub fn window_by_id(window_id: u64) -> Result<Option<NiriWindow>, Box<dyn Error>
     let windows: Vec<NiriWindow> = query_niri("windows")?;
 
     Ok(windows.into_iter().find(|window| window.id == window_id))
+}
+
+pub fn window_is_on_workspace_index(
+    window_id: u64,
+    workspace_index: u64,
+) -> Result<bool, Box<dyn Error>> {
+    let window =
+        window_by_id(window_id)?.ok_or_else(|| format!("Niri window {window_id} was not found"))?;
+
+    let workspace_id = window
+        .workspace_id
+        .ok_or_else(|| format!("Niri window {window_id} has no workspace"))?;
+
+    let workspaces: Vec<NiriWorkspace> = query_niri("workspaces")?;
+
+    let workspace = workspaces
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| format!("Niri workspace runtime ID {workspace_id} was not found"))?;
+
+    Ok(workspace.idx == workspace_index)
 }
 
 pub fn window_is_alone_in_column(window_id: u64) -> Result<bool, Box<dyn Error>> {
