@@ -40,6 +40,17 @@ type Workspace struct {
 	// sessions, so this is a hint for restore, not a guarantee.
 	OutputHint string `yaml:"output_hint,omitempty"`
 
+	// IdxHint is the workspace's position (1-based) on its output at
+	// capture time, used as a best-effort niri workspace "reference" for
+	// restore actions. IMPORTANT: niri's own documentation is explicit
+	// that workspace index is NOT stable identity -- it refers to
+	// "whichever workspace currently happens to be at this position,"
+	// and can point to a different workspace entirely if workspaces have
+	// been reordered since capture. This is an approximation, consistent
+	// with the design doc's guidance to prefer a deterministic
+	// approximation over pretending exact restoration is guaranteed.
+	IdxHint uint8 `yaml:"idx_hint"`
+
 	// IsFavorite marks the startup workspace (Part 10 of the requirements
 	// doc / Part 9 of the design doc). Not used yet in Phase 2 -- captured
 	// now so the field exists and defaults sensibly before Phase 6 needs it.
@@ -58,10 +69,22 @@ type Entity struct {
 	AppID string `yaml:"app_id"`
 	Title string `yaml:"title"`
 
+	// Launch is best-effort, captured from /proc/<pid>/cmdline at the
+	// moment of capture (see internal/procinfo). It may be empty if we
+	// couldn't read it -- an entity with no launch command captured simply
+	// cannot be restored yet, which is the correct, honest outcome rather
+	// than guessing a command.
+	Launch LaunchSpec `yaml:"launch,omitempty"`
+
 	// LastSeen is advisory/debugging information only. It must never be
 	// treated as identity across a restart -- niri assigns new window IDs
 	// every session.
 	LastSeen LastSeen `yaml:"last_seen"`
+}
+
+// LaunchSpec is the command used to relaunch this entity's application.
+type LaunchSpec struct {
+	Command []string `yaml:"command,omitempty"`
 }
 
 // LastSeen records what we observed at capture time, for debugging only.

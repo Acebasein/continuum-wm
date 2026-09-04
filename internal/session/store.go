@@ -10,6 +10,7 @@ import (
 
 	"continuum-wm/internal/idgen"
 	"continuum-wm/internal/niri"
+	"continuum-wm/internal/procinfo"
 )
 
 // Save writes the session to path as YAML. It always updates UpdatedAt
@@ -102,6 +103,7 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 	for _, nw := range niriWorkspaces {
 		ws := Workspace{
 			PersistentID: idgen.New("ws"),
+			IdxHint:      nw.Idx,
 			IsFavorite:   false, // Phase 2 doesn't set this yet; Phase 6 will
 		}
 		if nw.Output != nil {
@@ -127,6 +129,13 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 			}
 			if win.Title != nil {
 				ent.Title = *win.Title
+			}
+			if win.PID != nil {
+				// Best-effort only -- see internal/procinfo. The PID is
+				// used here transiently and is never itself persisted.
+				if cmd, err := procinfo.ReadCmdline(*win.PID); err == nil {
+					ent.Launch.Command = cmd
+				}
 			}
 			ws.Entities = append(ws.Entities, ent)
 		}

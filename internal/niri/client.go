@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"syscall"
 )
 
 // Client talks to niri exclusively via the `niri msg` CLI wrapper around
@@ -62,7 +63,69 @@ func (c *Client) Windows(ctx context.Context) ([]Window, error) {
 	return wins, nil
 }
 
-// EventStream starts `niri msg --json event-stream` as a long-running
+// MoveWindowToWorkspace moves the window with the given id to the
+// workspace identified by reference (a workspace index or name, matching
+// niri's own addressing scheme -- see design doc Part 10/17 for why exact
+// pixel/geometry addressing isn't used here).
+//
+// focus=false means the user's current focus is left alone -- important
+// for Continuum-WM, since restore actions happen in the background and
+// should not yank focus away from whatever the person is actually doing.
+//
+// Verified against `niri msg action move-window-to-workspace --help` and
+// `niri msg action focus-window --help` on 2026-09-03 -- see conversation
+// history / commit message for the exact output. Do not assume these flags
+// without re-checking if you're reading this after a niri upgrade.
+func (c *Client) MoveWindowToWorkspace(ctx context.Context, windowID uint64, reference string, focus bool) error {
+	args := []string{
+		"msg", "action", "move-window-to-workspace",
+		"--window-id", fmt.Sprintf("%d", windowID),
+		"--focus", fmt.Sprintf("%t", focus),
+		reference,
+	}
+	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("niri msg action move-window-to-workspace failed: %w (output: %s)", err, string(out))
+	}
+	return nil
+}
+
+// LaunchDetached starts command as a new, independent process -- NOT a
+// child that continuum-cli waits on or is responsible for supervising.
+// This matters because the launched application (e.g. Ghostty) should keep
+// running after continuum-cli's restore command finishes; it should not be
+// killed when our process exits, and it should not be tied to our
+// process's stdin/stdout.
+func LaunchDetached(command []string) (pid int32, err error) {
+	if len(command) == 0 {
+		return 0, fmt.Errorf("empty launch command")
+	}
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = detachedSysProcAttr()
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("starting %v: %w", command, err)
+	}
+
+	// Reap the process in the background once it exits, without blocking
+	// our caller -- otherwise it becomes a zombie process once it exits,
+	// since nothing else is waiting on it.
+	go cmd.Wait()
+
+	return int32(cmd.Process.Pid), nil
+}
+
+// detachedSysProcAttr configures the launched process to start its own
+// session (Setsid), detaching it from continuum-cli's process group. This
+// is Linux-specific but that's fine -- Continuum-WM's Niri backend only
+// ever runs on Linux.
+func detachedSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setsid: true}
+}
+
 // subprocess and returns a channel of parsed events plus a channel of
 // non-fatal parse errors (e.g. a single malformed line -- we keep reading
 // rather than aborting the whole stream over one bad line). The returned
