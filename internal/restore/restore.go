@@ -4,19 +4,15 @@
 // Phase 3 scope: ONE saved entity, matched via app_id + baseline-diffing
 // (a newly appeared window, since we launched it, with the right app_id).
 //
-// Phase 4 addition: when a saved entity has a high-confidence CWD (Part 6),
-// we cross-check the matched window's actual CWD before trusting the match
-// (see the CWD VERIFICATION step below) -- this is Part 7's CWD signal,
-// used as a post-match sanity check rather than full a-priori scoring.
-//
-// Known remaining gap, not yet handled: if TWO windows of the same app_id
-// appear within the observation window (e.g. the user manually opens a
-// second instance during a restore, or a race with another in-flight
-// restore of the same app), this code still takes the first one it sees
-// rather than detecting the ambiguity and reporting AMBIGUOUS. Worth
-// revisiting once we have a concrete scenario to test it against, per the
-// project's general principle of not building speculative complexity
-// ahead of a real test case.
+// Phase 4 additions:
+//   - a brief "settle window" after the first candidate window appears,
+//     to detect a race where a second window of the same app_id shows up
+//     too (see settleWindow) -- multiple candidates are disambiguated via
+//     saved CWD when possible, and reported as AMBIGUOUS otherwise, never
+//     guessed.
+//   - when a saved entity has a high-confidence CWD (Part 6), we
+//     cross-check the matched window's actual CWD before trusting the
+//     match, as a secondary safety net beyond the disambiguation above.
 package restore
 
 import (
@@ -33,15 +29,30 @@ import (
 type State string
 
 const (
-	StateLaunching          State = "LAUNCHING"
-	StateObserving          State = "OBSERVING"
-	StateMatched            State = "MATCHED"
-	StatePlacing            State = "PLACING"
-	StateVerifying          State = "VERIFYING"
-	StateRestored           State = "RESTORED"
-	StateFailed             State = "FAILED"
-	StatePartiallyRestored  State = "PARTIALLY_RESTORED"
+	StateLaunching         State = "LAUNCHING"
+	StateObserving         State = "OBSERVING"
+	StateMatched           State = "MATCHED"
+	StatePlacing           State = "PLACING"
+	StateVerifying         State = "VERIFYING"
+	StateRestored          State = "RESTORED"
+	StateFailed            State = "FAILED"
+	StatePartiallyRestored State = "PARTIALLY_RESTORED"
+
+	// StateAmbiguous: more than one plausible new window appeared for this
+	// entity, and we could not confidently pick one -- see the settle
+	// window / disambiguation logic in Entity. Per the project's core
+	// principle, we never guess here: nothing is touched or placed.
+	StateAmbiguous State = "AMBIGUOUS"
 )
+
+// settleWindow is how long we keep watching for ADDITIONAL candidate
+// windows after the first one appears, before deciding whether we have a
+// clean single match or a genuine ambiguity to resolve/report. This value
+// is a first guess, not something we've validated empirically yet -- see
+// design doc Part 16 risk notes; revisit if real testing shows it's too
+// short (a legitimately slow second window) or too long (unnecessarily
+// delaying every restore).
+const settleWindow = 750 * time.Millisecond
 
 // Result describes the final outcome of a restore attempt, plus enough
 // detail to explain why, per the design doc's emphasis on visible,
@@ -105,13 +116,29 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 	}
 
 	// --- OBSERVING / MATCHED ---
-	// Phase 3 matching rule (deliberately simple -- see package doc):
-	// the first WindowOpenedOrChanged event whose id was NOT in our
-	// baseline, and whose app_id matches, is our match. No scoring, no
-	// ambiguity handling -- those require multiple candidates to exist,
-	// which Phase 3's test setup guarantees will not happen.
-	var matchedID uint64
-	matchLoop:
+	// Phase 4: rather than committing to the FIRST qualifying window we
+	// see (Phase 3's behavior, which is vulnerable to a race -- e.g. the
+	// user manually opens a second window of the same app_id during our
+	// observation window), we wait for a brief settle period after the
+	// first candidate appears, collecting any others that show up too.
+	// This is what makes ambiguity detectable at all: without it, a race
+	// is indistinguishable from the normal case.
+	var candidates []uint64
+	seen := make(map[uint64]bool)
+
+	collectCandidate := func(w niri.Window) {
+		if existingIDs[w.ID] || seen[w.ID] {
+			return // pre-existing window, or already recorded
+		}
+		if w.AppID == nil || *w.AppID != ent.AppID {
+			return // some other app opened a window at the same time
+		}
+		seen[w.ID] = true
+		candidates = append(candidates, w.ID)
+	}
+
+	// Phase A: wait (up to the full timeout) for the FIRST candidate.
+waitForFirst:
 	for {
 		select {
 		case ev, ok := <-events:
@@ -119,28 +146,99 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 				return Result{State: StateFailed, Reason: "event stream closed before a matching window appeared"}
 			}
 			if ev.Kind == niri.EventWindowOpenedOrChanged {
-				w := ev.WindowOpenedOrChanged.Window
-				if existingIDs[w.ID] {
-					continue // pre-existing window, not our launch
+				collectCandidate(ev.WindowOpenedOrChanged.Window)
+				if len(candidates) > 0 {
+					break waitForFirst
 				}
-				if w.AppID == nil || *w.AppID != ent.AppID {
-					continue // some other app opened a window at the same time
-				}
-				matchedID = w.ID
-				break matchLoop
 			}
 
 		case perr, ok := <-errs:
 			if ok {
-				// A parse error on one line isn't fatal to the whole
-				// observation -- keep waiting, consistent with Phase 1's
-				// "don't crash on one bad line" design.
 				fmt.Printf("  (non-fatal parse error while observing: %v)\n", perr)
 			}
 
 		case <-obsCtx.Done():
 			return Result{State: StateFailed, Reason: fmt.Sprintf("timed out after %s waiting for app_id=%q to appear", timeout, ent.AppID)}
 		}
+	}
+
+	// Phase B: having seen one candidate, keep watching briefly for any
+	// others, so a race is detected rather than silently resolved by
+	// whichever window happened to be first.
+	settleTimer := time.NewTimer(settleWindow)
+	defer settleTimer.Stop()
+settleLoop:
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				break settleLoop
+			}
+			if ev.Kind == niri.EventWindowOpenedOrChanged {
+				collectCandidate(ev.WindowOpenedOrChanged.Window)
+			}
+
+		case perr, ok := <-errs:
+			if ok {
+				fmt.Printf("  (non-fatal parse error while settling: %v)\n", perr)
+			}
+
+		case <-settleTimer.C:
+			break settleLoop
+
+		case <-obsCtx.Done():
+			break settleLoop
+		}
+	}
+
+	var matchedID uint64
+	switch len(candidates) {
+	case 0:
+		// Shouldn't happen (Phase A guarantees at least one), but handle
+		// defensively rather than silently proceeding with a zero-value ID.
+		return Result{State: StateFailed, Reason: "internal error: no candidates recorded despite exiting the wait phase"}
+
+	case 1:
+		matchedID = candidates[0]
+		fmt.Printf("  observed 1 candidate window (id=%d) -- no ambiguity to resolve\n", matchedID)
+
+	default:
+		fmt.Printf("  observed %d candidate windows with app_id=%q: %v -- attempting to disambiguate\n", len(candidates), ent.AppID, candidates)
+		// More than one candidate -- attempt CWD-based disambiguation if
+		// we have a trustworthy saved CWD to check against. This is Part
+		// 7's CWD signal used as an ACTIVE disambiguator, not just a
+		// post-match sanity check.
+		if ent.ProviderMetadata.CWDConfidence != session.CWDHigh || !session.IsKnownTerminal(ent.AppID) {
+			return Result{
+				State:  StateAmbiguous,
+				Reason: fmt.Sprintf("%d windows with app_id=%q appeared, and no reliable saved CWD is available to disambiguate them -- refusing to guess", len(candidates), ent.AppID),
+			}
+		}
+
+		var cwdMatches []uint64
+		for _, id := range candidates {
+			pid, ok := findWindowPID(ctx, client, id)
+			if !ok {
+				continue
+			}
+			cwd, confidence := session.ResolveTerminalCWD(ent.AppID, pid)
+			if confidence == session.CWDHigh && cwd == ent.ProviderMetadata.CWD {
+				cwdMatches = append(cwdMatches, id)
+			}
+		}
+
+		if len(cwdMatches) != 1 {
+			return Result{
+				State: StateAmbiguous,
+				Reason: fmt.Sprintf(
+					"%d windows with app_id=%q appeared; %d of them had a cwd matching the saved value %q -- refusing to guess unless exactly one matches",
+					len(candidates), ent.AppID, len(cwdMatches), ent.ProviderMetadata.CWD,
+				),
+			}
+		}
+
+		matchedID = cwdMatches[0]
+		fmt.Printf("  disambiguated by cwd: window id=%d matched saved cwd %q\n", matchedID, ent.ProviderMetadata.CWD)
 	}
 
 	// --- CWD VERIFICATION (Phase 4 addition) ---
