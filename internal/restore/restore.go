@@ -1,9 +1,22 @@
 // Package restore implements the per-entity restore state machine described
-// in the design doc, Part 8. Phase 3 implements a deliberately narrow slice
-// of it: ONE saved entity, assumed to be the only window of its app_id
-// currently running. Multi-instance disambiguation (scoring, confidence,
-// AMBIGUOUS) is Phase 4's job -- adding it here now would mean testing
-// complex logic against conditions we haven't built yet.
+// in the design doc, Part 8.
+//
+// Phase 3 scope: ONE saved entity, matched via app_id + baseline-diffing
+// (a newly appeared window, since we launched it, with the right app_id).
+//
+// Phase 4 addition: when a saved entity has a high-confidence CWD (Part 6),
+// we cross-check the matched window's actual CWD before trusting the match
+// (see the CWD VERIFICATION step below) -- this is Part 7's CWD signal,
+// used as a post-match sanity check rather than full a-priori scoring.
+//
+// Known remaining gap, not yet handled: if TWO windows of the same app_id
+// appear within the observation window (e.g. the user manually opens a
+// second instance during a restore, or a race with another in-flight
+// restore of the same app), this code still takes the first one it sees
+// rather than detecting the ambiguity and reporting AMBIGUOUS. Worth
+// revisiting once we have a concrete scenario to test it against, per the
+// project's general principle of not building speculative complexity
+// ahead of a real test case.
 package restore
 
 import (
@@ -70,6 +83,15 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 	}
 
 	// --- LAUNCHING ---
+	// If we have a saved CWD for this entity, pass it through explicitly
+	// (see niri.LaunchDetached) rather than letting the new process
+	// inherit continuum-cli's own directory -- confirmed experimentally
+	// that without this, every restored terminal silently opened wherever
+	// continuum-cli itself was run from, regardless of each entity's
+	// actual saved directory. The CWD verification step further below
+	// remains as a secondary safety net (e.g. for entities where this
+	// isn't applicable, or to catch a genuine matching error), not the
+	// primary mechanism for getting the directory right.
 	obsCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -78,7 +100,7 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 		return Result{State: StateFailed, Reason: fmt.Sprintf("could not start event stream: %v", err)}
 	}
 
-	if _, err := niri.LaunchDetached(ent.Launch.Command); err != nil {
+	if _, err := niri.LaunchDetached(ent.Launch.Command, ent.ProviderMetadata.CWD); err != nil {
 		return Result{State: StateFailed, Reason: fmt.Sprintf("launch failed: %v", err)}
 	}
 
@@ -118,6 +140,35 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 
 		case <-obsCtx.Done():
 			return Result{State: StateFailed, Reason: fmt.Sprintf("timed out after %s waiting for app_id=%q to appear", timeout, ent.AppID)}
+		}
+	}
+
+	// --- CWD VERIFICATION (Phase 4 addition) ---
+	// If we have a trustworthy saved CWD for this entity (Part 7's
+	// strongest disambiguation signal), cross-check it against the
+	// newly matched window's actual CWD before proceeding. This is what
+	// lets us catch a bad match (e.g. a relaunch race where a second,
+	// unrelated window of the same app_id appeared first) instead of
+	// blindly placing whatever the baseline-diff happened to find.
+	//
+	// If we can't determine the candidate's CWD (its shell may not have
+	// been assigned/settled yet, or it isn't a recognized terminal), we
+	// proceed anyway -- app_id + baseline-diffing is still real evidence
+	// on its own; the CWD check is a bonus verification when available,
+	// not a requirement to proceed.
+	if ent.ProviderMetadata.CWDConfidence == session.CWDHigh && session.IsKnownTerminal(ent.AppID) {
+		if pid, ok := findWindowPID(ctx, client, matchedID); ok {
+			candidateCWD, candidateConfidence := session.ResolveTerminalCWD(ent.AppID, pid)
+			if candidateConfidence == session.CWDHigh && candidateCWD != ent.ProviderMetadata.CWD {
+				return Result{
+					State: StateFailed,
+					Reason: fmt.Sprintf(
+						"matched window (id=%d) has cwd %q, which does not match saved cwd %q -- refusing to place (likely a relaunch race with another instance of the same app)",
+						matchedID, candidateCWD, ent.ProviderMetadata.CWD,
+					),
+					NiriWindowID: matchedID,
+				}
+			}
 		}
 	}
 
@@ -176,4 +227,19 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 		Reason:       "window matched and placement command succeeded, but the window could not be found on re-query",
 		NiriWindowID: matchedID,
 	}
+}
+
+// findWindowPID looks up a live window's PID by its niri window id.
+// Returns ok=false if the window can't be found or has no PID reported.
+func findWindowPID(ctx context.Context, client *niri.Client, windowID uint64) (int32, bool) {
+	windows, err := client.Windows(ctx)
+	if err != nil {
+		return 0, false
+	}
+	for _, w := range windows {
+		if w.ID == windowID && w.PID != nil {
+			return *w.PID, true
+		}
+	}
+	return 0, false
 }

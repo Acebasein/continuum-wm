@@ -76,6 +76,12 @@ type Entity struct {
 	// than guessing a command.
 	Launch LaunchSpec `yaml:"launch,omitempty"`
 
+	// ProviderMetadata holds app-specific captured data -- currently just
+	// working directory, for terminal-like apps. See CWDConfidence: an
+	// empty CWD with confidence "unknown" is a deliberate, honest outcome,
+	// never a guess (design doc, Part 6).
+	ProviderMetadata ProviderMetadata `yaml:"provider_metadata,omitempty"`
+
 	// LastSeen is advisory/debugging information only. It must never be
 	// treated as identity across a restart -- niri assigns new window IDs
 	// every session.
@@ -85,6 +91,33 @@ type Entity struct {
 // LaunchSpec is the command used to relaunch this entity's application.
 type LaunchSpec struct {
 	Command []string `yaml:"command,omitempty"`
+}
+
+// CWDConfidence describes how much we trust ProviderMetadata.CWD.
+type CWDConfidence string
+
+const (
+	// CWDHigh: this window's process ID belonged to exactly one window at
+	// capture time, so reading /proc/<pid>/cwd unambiguously describes it.
+	CWDHigh CWDConfidence = "high"
+
+	// CWDUnknown: either we couldn't read /proc/<pid>/cwd at all, or --
+	// importantly -- this PID was shared by more than one window at
+	// capture time (as confirmed happening with GNOME/GTK single-instance
+	// apps like Nautilus, and possibly Ghostty), making it impossible to
+	// know which window the directory actually belongs to. Per the design
+	// doc's core rule, an unknown CWD must never be guessed at restore
+	// time -- it means "launch the app, but do not attempt to set a
+	// working directory."
+	CWDUnknown CWDConfidence = "unknown"
+)
+
+// ProviderMetadata holds application-specific captured data. Phase 4 only
+// populates the CWD fields (generic terminal handling); richer per-app
+// providers are Phase 8's job (design doc, Part 11).
+type ProviderMetadata struct {
+	CWD           string        `yaml:"cwd,omitempty"`
+	CWDConfidence CWDConfidence `yaml:"cwd_confidence,omitempty"`
 }
 
 // LastSeen records what we observed at capture time, for debugging only.

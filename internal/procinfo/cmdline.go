@@ -55,3 +55,17 @@ func ReadCmdline(pid int32) ([]string, error) {
 	}
 	return args, nil
 }
+
+// ReadCwd reads /proc/<pid>/cwd, a symlink to the process's current
+// working directory, and returns the resolved path.
+//
+// Same transient-use rule as ReadCmdline: pid is used once, right now, to
+// resolve a path string -- the pid itself is never persisted.
+func ReadCwd(pid int32) (string, error) {
+	path := fmt.Sprintf("/proc/%d/cwd", pid)
+	target, err := os.Readlink(path)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	return target, nil
+}

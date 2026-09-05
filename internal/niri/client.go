@@ -96,7 +96,15 @@ func (c *Client) MoveWindowToWorkspace(ctx context.Context, windowID uint64, ref
 // running after continuum-cli's restore command finishes; it should not be
 // killed when our process exits, and it should not be tied to our
 // process's stdin/stdout.
-func LaunchDetached(command []string) (pid int32, err error) {
+//
+// workDir, if non-empty, sets the new process's initial working directory
+// explicitly. THIS MATTERS: without it, a spawned process inherits
+// continuum-cli's OWN current directory (standard Unix fork/exec
+// behavior) -- confirmed experimentally to cause every restored terminal
+// to open in whatever directory continuum-cli itself happened to be run
+// from, regardless of each entity's saved CWD. Pass "" to leave the
+// default (parent-inherited) behavior for entities with no known CWD.
+func LaunchDetached(command []string, workDir string) (pid int32, err error) {
 	if len(command) == 0 {
 		return 0, fmt.Errorf("empty launch command")
 	}
@@ -104,6 +112,7 @@ func LaunchDetached(command []string) (pid int32, err error) {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	cmd.Dir = workDir
 	cmd.SysProcAttr = detachedSysProcAttr()
 
 	if err := cmd.Start(); err != nil {
