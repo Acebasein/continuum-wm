@@ -43,6 +43,16 @@ const (
 	// window / disambiguation logic in Entity. Per the project's core
 	// principle, we never guess here: nothing is touched or placed.
 	StateAmbiguous State = "AMBIGUOUS"
+
+	// StateAlreadyPresent (Phase 5): a live window was confidently
+	// identified as already being this saved entity, BEFORE any launch
+	// was attempted. Per the design doc's "live desktop must win"
+	// principle, we do NOT move, resize, or otherwise touch it -- its
+	// current position is authoritative, not the saved one. This is also
+	// what makes restore idempotent: re-running Reconcile against an
+	// already-restored entity should reach this state again, not launch a
+	// duplicate.
+	StateAlreadyPresent State = "ALREADY_PRESENT"
 )
 
 // settleWindow is how long we keep watching for ADDITIONAL candidate
@@ -61,6 +71,68 @@ type Result struct {
 	State        State
 	Reason       string
 	NiriWindowID uint64 // 0 if we never matched a window
+}
+
+// Reconcile is Phase 5's entry point, and the one continuum-cli's restore
+// command should call instead of Entity directly. It checks whether a live
+// window already confidently satisfies this saved entity BEFORE attempting
+// any launch -- this is what makes restore idempotent (Part 12) and
+// respects "live desktop must win": if something's already there, we
+// leave it alone rather than assuming the saved state is more correct.
+//
+// HONEST LIMITATION, worth being direct about: we can only confidently
+// claim ALREADY_PRESENT for known terminals with a high-confidence saved
+// CWD (see session.IsKnownTerminal / CWDHigh) -- that's currently our only
+// reliable per-instance identity signal. For every other app (Ghostty,
+// Firefox, Nautilus, ONLYOFFICE, Typora, ...), we have no way to tell
+// "this live window IS the saved entity" apart from "this is a coincidentally
+// similar window" -- app_id alone was already established as insufficient
+// (Part 4). Rather than guess, Reconcile falls through to MISSING for
+// those cases every time, which means: idempotency is NOT yet guaranteed
+// for those apps -- re-running restore on them will launch a duplicate.
+// This is a real, named gap, not a bug -- closing it properly is
+// Application Providers' job (Part 11 / Phase 8), where a provider could
+// ask an app directly what windows it has open. Logged in the design doc.
+func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, timeout time.Duration) Result {
+	if ent.AppID == "" {
+		return Result{State: StateFailed, Reason: "entity has no app_id -- refusing to guess how to match it"}
+	}
+
+	liveWindows, err := client.Windows(ctx)
+	if err != nil {
+		return Result{State: StateFailed, Reason: fmt.Sprintf("could not read live windows for reconciliation: %v", err)}
+	}
+
+	var candidates []niri.Window
+	for _, w := range liveWindows {
+		if w.AppID != nil && *w.AppID == ent.AppID {
+			candidates = append(candidates, w)
+		}
+	}
+
+	if len(candidates) > 0 && ent.ProviderMetadata.CWDConfidence == session.CWDHigh && session.IsKnownTerminal(ent.AppID) {
+		var matches []niri.Window
+		for _, w := range candidates {
+			if w.PID == nil {
+				continue
+			}
+			cwd, confidence := session.ResolveTerminalCWD(ent.AppID, *w.PID)
+			if confidence == session.CWDHigh && cwd == ent.ProviderMetadata.CWD {
+				matches = append(matches, w)
+			}
+		}
+		if len(matches) == 1 {
+			w := matches[0]
+			fmt.Printf("  already present: window id=%d matches saved cwd %q -- skipping launch\n", w.ID, ent.ProviderMetadata.CWD)
+			return Result{State: StateAlreadyPresent, NiriWindowID: w.ID}
+		}
+		// Zero or multiple matches among existing windows -- we cannot
+		// safely claim any one of them IS this entity. Fall through to
+		// MISSING (launch fresh) rather than guess.
+	}
+
+	fmt.Printf("  no confirmed pre-existing match among %d live window(s) with app_id=%q -- proceeding to launch\n", len(candidates), ent.AppID)
+	return Entity(ctx, client, ent, workspaceIdxHint, timeout)
 }
 
 // Entity attempts to restore a single saved entity, using workspaceIdxHint

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -102,11 +103,29 @@ func (c *Client) MoveWindowToWorkspace(ctx context.Context, windowID uint64, ref
 // continuum-cli's OWN current directory (standard Unix fork/exec
 // behavior) -- confirmed experimentally to cause every restored terminal
 // to open in whatever directory continuum-cli itself happened to be run
-// from, regardless of each entity's saved CWD. Pass "" to leave the
-// default (parent-inherited) behavior for entities with no known CWD.
+// from, regardless of each entity's saved CWD.
+//
+// If workDir is empty (no saved CWD is known/trusted for this entity --
+// e.g. Ghostty, where we deliberately never guess per-window CWD), we
+// still explicitly default to the user's home directory rather than
+// leaving cmd.Dir unset. Confirmed this matters in practice: leaving it
+// unset caused restored Ghostty windows to silently inherit whatever
+// directory the OPERATOR happened to be running continuum-cli from at the
+// time -- an accidental, invoker-dependent result, not a meaningful
+// default. $HOME is at least predictable and doesn't depend on where the
+// tool is invoked from, which also matters once this runs as a background
+// daemon (Part 18) rather than something launched by hand from a shell.
 func LaunchDetached(command []string, workDir string) (pid int32, err error) {
 	if len(command) == 0 {
 		return 0, fmt.Errorf("empty launch command")
+	}
+	if workDir == "" {
+		if home, herr := os.UserHomeDir(); herr == nil {
+			workDir = home
+		}
+		// If even UserHomeDir fails, workDir stays "" and cmd.Dir is left
+		// unset below -- falling back to default inherited behavior as a
+		// last resort, rather than failing the whole launch over it.
 	}
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin = nil
