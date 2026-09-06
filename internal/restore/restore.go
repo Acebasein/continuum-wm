@@ -211,6 +211,33 @@ func checkWorkspaceConflicts(ctx context.Context, client *niri.Client, workspace
 	return unrelated, nil
 }
 
+// buildLaunchCommand returns the actual command to execute for this
+// entity, applying a small, targeted per-app override where the generic
+// launch mechanism (plain command + cmd.Dir) is known to be unreliable.
+// This is an early, minimal precursor to the full Application Provider
+// architecture (design doc Part 11 / Phase 8) -- a real per-app override,
+// just not yet built as a pluggable interface.
+//
+// GHOSTTY: confirmed via real testing that Ghostty can silently route a
+// plain `ghostty` launch through GTK/D-Bus single-instance activation,
+// collapsing multiple "separate" launches into windows served by ONE
+// existing process -- at which point cmd.Dir (set on the process WE
+// spawn) is meaningless, since that process may not be the one that ends
+// up owning the new window at all. Ghostty's own `+new-window
+// --working-directory=<path>` CLI action sidesteps this entirely: it's an
+// explicit instruction to WHICHEVER instance ends up creating the window,
+// not dependent on process-level working-directory inheritance. Confirmed
+// working directly against the user's installed Ghostty version before
+// relying on it here.
+func buildLaunchCommand(ent session.Entity) []string {
+	if ent.AppID == "com.mitchellh.ghostty" &&
+		ent.ProviderMetadata.CWDConfidence == session.CWDHigh &&
+		ent.ProviderMetadata.CWD != "" {
+		return []string{"ghostty", "+new-window", "--working-directory=" + ent.ProviderMetadata.CWD}
+	}
+	return ent.Launch.Command
+}
+
 // Entity attempts to restore a single saved entity, using workspaceIdxHint
 // (the workspace's captured niri index) as the placement target.
 //
@@ -259,7 +286,7 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 		return Result{State: StateFailed, Reason: fmt.Sprintf("could not start event stream: %v", err)}
 	}
 
-	if _, err := niri.LaunchDetached(ent.Launch.Command, ent.ProviderMetadata.CWD); err != nil {
+	if _, err := niri.LaunchDetached(buildLaunchCommand(ent), ent.ProviderMetadata.CWD); err != nil {
 		return Result{State: StateFailed, Reason: fmt.Sprintf("launch failed: %v", err)}
 	}
 
