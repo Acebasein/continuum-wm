@@ -71,6 +71,13 @@ type Result struct {
 	State        State
 	Reason       string
 	NiriWindowID uint64 // 0 if we never matched a window
+
+	// ConflictingAppIDs (Phase 5) lists app_ids of OTHER, unrelated live
+	// windows already present on the target workspace, if any. This is
+	// informational only -- see checkWorkspaceConflicts below for why
+	// Niri's scrolling layout doesn't require blocking or relocating
+	// anything when this is non-empty.
+	ConflictingAppIDs []string
 }
 
 // Reconcile is Phase 5's entry point, and the one continuum-cli's restore
@@ -96,6 +103,16 @@ type Result struct {
 func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, timeout time.Duration) Result {
 	if ent.AppID == "" {
 		return Result{State: StateFailed, Reason: "entity has no app_id -- refusing to guess how to match it"}
+	}
+
+	// Informational only -- see checkWorkspaceConflicts. Computed once,
+	// up front, and attached to whatever Result we end up returning below,
+	// regardless of which path (already-present or fresh-launch) we take.
+	conflicts, cerr := checkWorkspaceConflicts(ctx, client, workspaceIdxHint, ent.AppID)
+	if cerr != nil {
+		fmt.Printf("  (non-fatal: could not check for workspace conflicts: %v)\n", cerr)
+	} else if len(conflicts) > 0 {
+		fmt.Printf("  note: target workspace idx=%d already has unrelated window(s) present: %v -- will place alongside them, nothing will be moved or closed\n", workspaceIdxHint, conflicts)
 	}
 
 	liveWindows, err := client.Windows(ctx)
@@ -124,7 +141,7 @@ func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, wor
 		if len(matches) == 1 {
 			w := matches[0]
 			fmt.Printf("  already present: window id=%d matches saved cwd %q -- skipping launch\n", w.ID, ent.ProviderMetadata.CWD)
-			return Result{State: StateAlreadyPresent, NiriWindowID: w.ID}
+			return Result{State: StateAlreadyPresent, NiriWindowID: w.ID, ConflictingAppIDs: conflicts}
 		}
 		// Zero or multiple matches among existing windows -- we cannot
 		// safely claim any one of them IS this entity. Fall through to
@@ -132,7 +149,66 @@ func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, wor
 	}
 
 	fmt.Printf("  no confirmed pre-existing match among %d live window(s) with app_id=%q -- proceeding to launch\n", len(candidates), ent.AppID)
-	return Entity(ctx, client, ent, workspaceIdxHint, timeout)
+	result := Entity(ctx, client, ent, workspaceIdxHint, timeout)
+	result.ConflictingAppIDs = conflicts
+	return result
+}
+
+// checkWorkspaceConflicts looks at the live windows currently on the
+// workspace addressed by workspaceIdxHint and returns the distinct app_ids
+// present there that are NOT ownAppID -- i.e. content unrelated to what
+// we're about to restore.
+//
+// This is INFORMATIONAL ONLY, deliberately not a blocking check: unlike a
+// traditional floating-window WM, Niri's scrolling layout has no concept
+// of two windows competing for the same physical slot -- a workspace
+// simply accumulates windows side by side, and placing a new one never
+// requires evicting or relocating anything already there. So there is no
+// "place elsewhere instead" decision to make here; we still go ahead and
+// place the restored entity normally. This exists purely so the user (and
+// our own logs) can see when a workspace wasn't the clean, empty slate the
+// saved session assumed -- worth knowing, not worth blocking on.
+func checkWorkspaceConflicts(ctx context.Context, client *niri.Client, workspaceIdxHint uint8, ownAppID string) ([]string, error) {
+	liveWorkspaces, err := client.Workspaces(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading workspaces: %w", err)
+	}
+	var targetWorkspaceID uint64
+	found := false
+	for _, w := range liveWorkspaces {
+		if w.Idx == workspaceIdxHint {
+			targetWorkspaceID = w.ID
+			found = true
+			break
+		}
+	}
+	if !found {
+		// Target workspace doesn't exist yet (e.g. restoring into a
+		// not-yet-created trailing workspace) -- nothing there to conflict
+		// with.
+		return nil, nil
+	}
+
+	liveWindows, err := client.Windows(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading windows: %w", err)
+	}
+
+	seen := make(map[string]bool)
+	var unrelated []string
+	for _, w := range liveWindows {
+		if w.WorkspaceID == nil || *w.WorkspaceID != targetWorkspaceID {
+			continue
+		}
+		if w.AppID == nil || *w.AppID == ownAppID {
+			continue
+		}
+		if !seen[*w.AppID] {
+			seen[*w.AppID] = true
+			unrelated = append(unrelated, *w.AppID)
+		}
+	}
+	return unrelated, nil
 }
 
 // Entity attempts to restore a single saved entity, using workspaceIdxHint
