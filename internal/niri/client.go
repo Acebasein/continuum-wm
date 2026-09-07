@@ -63,6 +63,39 @@ func (c *Client) Windows(ctx context.Context) ([]Window, error) {
 	return wins, nil
 }
 
+// MoveWindowToMonitor moves the window with the given id to the output
+// (monitor) named by outputName.
+//
+// WHY THIS MATTERS (confirmed via real multi-monitor testing): niri's own
+// docs state that a bare index reference (used by MoveWindowToWorkspace)
+// "refers to whichever workspace currently happens to be at this position
+// on the focused monitor" -- but confirmed EXPERIMENTALLY that this
+// applies to the no-window-id default case, NOT when --window-id is given
+// explicitly. When --window-id is given, the index resolves against THAT
+// WINDOW'S OWN current output, regardless of which monitor is globally
+// focused. This means: to correctly place a window onto a specific saved
+// (output, idx) pair, we must first ensure the window is actually ON that
+// output -- via this action -- before issuing MoveWindowToWorkspace with
+// a bare idx. Skipping this step risks silently landing a window on the
+// wrong monitor's workspace of the same index, with no error at all.
+//
+// Verified against `niri msg action move-window-to-monitor --help`: the
+// flag is `--id` here, NOT `--window-id` like MoveWindowToWorkspace uses
+// -- confirmed inconsistent naming between the two actions, don't assume
+// they match.
+func (c *Client) MoveWindowToMonitor(ctx context.Context, windowID uint64, outputName string) error {
+	args := []string{
+		"msg", "action", "move-window-to-monitor",
+		"--id", fmt.Sprintf("%d", windowID),
+		outputName,
+	}
+	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("niri msg action move-window-to-monitor failed: %w (output: %s)", err, string(out))
+	}
+	return nil
+}
+
 // MoveWindowToWorkspace moves the window with the given id to the
 // workspace identified by reference (a workspace index or name, matching
 // niri's own addressing scheme -- see design doc Part 10/17 for why exact

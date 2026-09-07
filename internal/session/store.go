@@ -345,7 +345,7 @@ var terminalAppIDs = map[string]bool{
 	"foot":                  true,
 	"org.gnome.Ptyxis":      true,
 	"org.gnome.Terminal":    true,
-	"konsole":               true,
+	"org.kde.konsole":        true,
 	"xterm":                 true,
 }
 

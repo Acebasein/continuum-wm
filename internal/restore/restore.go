@@ -100,7 +100,7 @@ type Result struct {
 // This is a real, named gap, not a bug -- closing it properly is
 // Application Providers' job (Part 11 / Phase 8), where a provider could
 // ask an app directly what windows it has open. Logged in the design doc.
-func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, timeout time.Duration) Result {
+func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, outputHint string, timeout time.Duration) Result {
 	if ent.AppID == "" {
 		return Result{State: StateFailed, Reason: "entity has no app_id -- refusing to guess how to match it"}
 	}
@@ -108,7 +108,7 @@ func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, wor
 	// Informational only -- see checkWorkspaceConflicts. Computed once,
 	// up front, and attached to whatever Result we end up returning below,
 	// regardless of which path (already-present or fresh-launch) we take.
-	conflicts, cerr := checkWorkspaceConflicts(ctx, client, workspaceIdxHint, ent.AppID)
+	conflicts, cerr := checkWorkspaceConflicts(ctx, client, workspaceIdxHint, outputHint, ent.AppID)
 	if cerr != nil {
 		fmt.Printf("  (non-fatal: could not check for workspace conflicts: %v)\n", cerr)
 	} else if len(conflicts) > 0 {
@@ -149,15 +149,24 @@ func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, wor
 	}
 
 	fmt.Printf("  no confirmed pre-existing match among %d live window(s) with app_id=%q -- proceeding to launch\n", len(candidates), ent.AppID)
-	result := Entity(ctx, client, ent, workspaceIdxHint, timeout)
+	result := Entity(ctx, client, ent, workspaceIdxHint, outputHint, timeout)
 	result.ConflictingAppIDs = conflicts
 	return result
 }
 
 // checkWorkspaceConflicts looks at the live windows currently on the
-// workspace addressed by workspaceIdxHint and returns the distinct app_ids
-// present there that are NOT ownAppID -- i.e. content unrelated to what
-// we're about to restore.
+// workspace addressed by (workspaceIdxHint, outputHint) and returns the
+// distinct app_ids present there that are NOT ownAppID -- i.e. content
+// unrelated to what we're about to restore.
+//
+// outputHint MATTERS: confirmed via real multi-monitor testing that two
+// different outputs can each have a workspace at the same idx (each
+// monitor has its own independent, 1-indexed workspace stack). Matching
+// on idx alone would silently pick whichever same-idx workspace happens
+// to come first in niri's list, regardless of which monitor it's
+// actually on -- a real, confirmed bug in an earlier version of this
+// function. When outputHint is empty (unknown), we fall back to
+// idx-only matching as a best-effort.
 //
 // This is INFORMATIONAL ONLY, deliberately not a blocking check: unlike a
 // traditional floating-window WM, Niri's scrolling layout has no concept
@@ -168,7 +177,7 @@ func Reconcile(ctx context.Context, client *niri.Client, ent session.Entity, wor
 // place the restored entity normally. This exists purely so the user (and
 // our own logs) can see when a workspace wasn't the clean, empty slate the
 // saved session assumed -- worth knowing, not worth blocking on.
-func checkWorkspaceConflicts(ctx context.Context, client *niri.Client, workspaceIdxHint uint8, ownAppID string) ([]string, error) {
+func checkWorkspaceConflicts(ctx context.Context, client *niri.Client, workspaceIdxHint uint8, outputHint string, ownAppID string) ([]string, error) {
 	liveWorkspaces, err := client.Workspaces(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("reading workspaces: %w", err)
@@ -176,11 +185,15 @@ func checkWorkspaceConflicts(ctx context.Context, client *niri.Client, workspace
 	var targetWorkspaceID uint64
 	found := false
 	for _, w := range liveWorkspaces {
-		if w.Idx == workspaceIdxHint {
-			targetWorkspaceID = w.ID
-			found = true
-			break
+		if w.Idx != workspaceIdxHint {
+			continue
 		}
+		if outputHint != "" && (w.Output == nil || *w.Output != outputHint) {
+			continue // same idx, but wrong monitor -- not our target
+		}
+		targetWorkspaceID = w.ID
+		found = true
+		break
 	}
 	if !found {
 		// Target workspace doesn't exist yet (e.g. restoring into a
@@ -239,14 +252,29 @@ func buildLaunchCommand(ent session.Entity) []string {
 }
 
 // Entity attempts to restore a single saved entity, using workspaceIdxHint
-// (the workspace's captured niri index) as the placement target.
+// (the workspace's captured niri index) and outputHint (the workspace's
+// captured monitor name) together as the placement target.
+//
+// outputHint MATTERS, confirmed via real multi-monitor testing: a bare
+// idx reference is ambiguous when more than one monitor has a workspace
+// at that position (each monitor has its own independent, 1-indexed
+// stack). The fix is NOT to focus the target monitor first (that would
+// steal the user's visible focus, and niri's own docs' "resolves relative
+// to the focused monitor" wording turned out to describe only the
+// no-window-id default case) -- instead, confirmed experimentally that
+// when --window-id is given explicitly (as we always do), the idx
+// reference resolves against THAT WINDOW'S OWN current output. So the
+// fix is: explicitly move the window to the correct output FIRST (see
+// niri.Client.MoveWindowToMonitor), then the existing idx-based
+// MoveWindowToWorkspace call resolves correctly against it, with no
+// global focus changes at all.
 //
 // This function deliberately does the state transitions in a strict,
 // visible sequence -- each step is logged as it happens (via the returned
 // Result at each stage isn't streamed today; Phase 9 will add proper
 // structured logging. For now, callers should print progress themselves,
 // as continuum-cli's restore command does).
-func Entity(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, timeout time.Duration) Result {
+func Entity(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, outputHint string, timeout time.Duration) Result {
 	if len(ent.Launch.Command) == 0 {
 		return Result{State: StateFailed, Reason: "no launch command was captured for this entity"}
 	}
@@ -446,6 +474,19 @@ settleLoop:
 	}
 
 	// --- PLACING ---
+	// Move to the correct MONITOR first (if known), so the idx-based
+	// reference below resolves against the right output -- see the
+	// function doc comment for why this order matters and why it doesn't
+	// require touching global focus.
+	if outputHint != "" {
+		if err := client.MoveWindowToMonitor(ctx, matchedID, outputHint); err != nil {
+			return Result{
+				State:        StatePartiallyRestored,
+				Reason:       fmt.Sprintf("window matched (id=%d) but could not move to monitor %q: %v", matchedID, outputHint, err),
+				NiriWindowID: matchedID,
+			}
+		}
+	}
 	reference := fmt.Sprintf("%d", workspaceIdxHint)
 	if err := client.MoveWindowToWorkspace(ctx, matchedID, reference, false); err != nil {
 		return Result{
@@ -457,9 +498,10 @@ settleLoop:
 
 	// --- VERIFYING ---
 	// Re-query live state and confirm the window ended up on a workspace
-	// whose idx matches what we asked for. We check idx rather than
-	// tracking a specific workspace id, because "reference" addressing is
-	// idx-based (see design doc caveat on IdxHint above).
+	// whose (idx, output) matches what we asked for -- output matters for
+	// the same multi-monitor reason as above: two different monitors can
+	// each have a workspace at the same idx, so idx alone isn't sufficient
+	// to confirm we landed in the right place.
 	liveWorkspaces, err := client.Workspaces(ctx)
 	if err != nil {
 		return Result{
@@ -468,9 +510,17 @@ settleLoop:
 			NiriWindowID: matchedID,
 		}
 	}
-	idxByWorkspaceID := make(map[uint64]uint8, len(liveWorkspaces))
+	type wsInfo struct {
+		idx    uint8
+		output string
+	}
+	infoByWorkspaceID := make(map[uint64]wsInfo, len(liveWorkspaces))
 	for _, w := range liveWorkspaces {
-		idxByWorkspaceID[w.ID] = w.Idx
+		info := wsInfo{idx: w.Idx}
+		if w.Output != nil {
+			info.output = *w.Output
+		}
+		infoByWorkspaceID[w.ID] = info
 	}
 
 	liveWindows, err := client.Windows(ctx)
@@ -485,8 +535,13 @@ settleLoop:
 		if w.ID != matchedID {
 			continue
 		}
-		if w.WorkspaceID != nil && idxByWorkspaceID[*w.WorkspaceID] == workspaceIdxHint {
-			return Result{State: StateRestored, NiriWindowID: matchedID}
+		if w.WorkspaceID != nil {
+			info := infoByWorkspaceID[*w.WorkspaceID]
+			idxOK := info.idx == workspaceIdxHint
+			outputOK := outputHint == "" || info.output == outputHint
+			if idxOK && outputOK {
+				return Result{State: StateRestored, NiriWindowID: matchedID}
+			}
 		}
 		return Result{
 			State:        StatePartiallyRestored,
