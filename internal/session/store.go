@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"continuum-wm/internal/desktopentry"
 	"continuum-wm/internal/idgen"
 	"continuum-wm/internal/niri"
 	"continuum-wm/internal/procinfo"
@@ -85,6 +87,11 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 
 	now := time.Now().UTC()
 
+	// Loaded once per capture, not per-window -- scanning the filesystem
+	// for every window would be wasteful, and desktop entries don't change
+	// mid-capture.
+	desktopEntries := desktopentry.Load()
+
 	s := &Session{
 		SchemaVersion: SchemaVersion,
 		SessionID:     idgen.New("session"),
@@ -150,7 +157,7 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 				if cmd, err := procinfo.ReadCmdline(*win.PID); err == nil {
 					procCmdline = cmd
 				}
-				ent.Launch.Command = resolveLaunchCommand(*win.AppID, procCmdline)
+				ent.Launch.Command = resolveLaunchCommand(*win.AppID, procCmdline, desktopEntries)
 
 				cwd, confidence := resolveCWD(*win.AppID, *win.PID, windowCountByPID[*win.PID] > 1)
 				ent.ProviderMetadata.CWD = cwd
@@ -166,40 +173,85 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 }
 
 // resolveLaunchCommand decides what command to save for relaunching this
-// entity. It prefers a plain, $PATH-resolvable command name derived from
-// app_id over the raw /proc/<pid>/cmdline capture, falling back to the
-// latter only when the former isn't usable.
+// entity. Tried in order, first success wins:
 //
-// WHY: confirmed via real testing that /proc/<pid>/cmdline on NixOS often
-// resolves to a content-addressed Nix store path (e.g.
+//  1. An XDG .desktop file matching app_id (or its StartupWMClass) -- see
+//     internal/desktopentry. This is the most reliable source: it's the
+//     SAME data app launchers like Rofi/Wofi use, it never looks at a
+//     PID at all (sidestepping the XWayland-proxy-PID problem confirmed
+//     with ONLYOFFICE), and it can produce launch commands the other
+//     strategies below have no way to discover (special flags, wrapper
+//     scripts, etc.).
+//  2. A plain, $PATH-resolvable command name derived from app_id.
+//  3. The raw /proc/<pid>/cmdline capture, as a last resort.
+//
+// WHY (2) AND (3) STILL EXIST, given (1) is better: not every running app
+// necessarily has a discoverable .desktop file (some are launched
+// directly from a script or built from source without installing one),
+// so this stays a layered fallback rather than a hard requirement.
+//
+// WHY NOT JUST /proc/<pid>/cmdline: confirmed via real testing that this
+// on NixOS often resolves to a content-addressed Nix store path (e.g.
 // "/nix/store/f0328rw.../bin/.ghostty-wrapped"), which becomes invalid the
 // moment a system rebuild changes that package's derivation hash -- a
 // saved session could silently stop being restorable after a routine
-// `nixos-rebuild switch`.
+// `nixos-rebuild switch`. Separately, confirmed with ONLYOFFICE that the
+// PID niri reports for an XWayland/X11 window can belong to the
+// xwayland-satellite bridge process, not the app itself, making
+// /proc-based capture read the WRONG process's command line entirely.
 //
-// This mirrors a design choice found in nirinit (a comparable, existing
-// niri session tool -- see docs/design doc risk notes): it never captures
-// an absolute path at all, defaulting instead to the literal app_id
-// (resolved via $PATH at spawn time) with a config override for apps whose
-// app_id doesn't map to a real binary name (PWAs, Flatpaks, etc.).
-//
-// We store the PLAIN command name here, not the absolute path LookPath
-// resolves to -- so that $PATH (and on NixOS, indirections like
-// /run/current-system/sw/bin/...) gets re-resolved fresh at restore time,
-// rather than baking in whatever happened to be true at capture time.
-func resolveLaunchCommand(appID string, procCmdline []string) []string {
+// Strategy (2) mirrors a design choice found in nirinit (a comparable,
+// existing niri session tool -- see docs/design doc risk notes): it never
+// captures an absolute path at all, defaulting instead to the literal
+// app_id (resolved via $PATH at spawn time). We store the PLAIN command
+// name here, not the absolute path LookPath resolves to -- so that $PATH
+// (and on NixOS, indirections like /run/current-system/sw/bin/...) gets
+// re-resolved fresh at restore time, rather than baking in whatever
+// happened to be true at capture time.
+func resolveLaunchCommand(appID string, procCmdline []string, desktopEntries *desktopentry.Index) []string {
+	if desktopEntries != nil {
+		if entry := desktopEntries.Lookup(appID); entry != nil {
+			if cmd := entry.LaunchCommand(); len(cmd) > 0 {
+				return sanitizeNixStorePath(cmd)
+			}
+		}
+	}
+
 	if candidate := commandNameFromAppID(appID); candidate != "" {
 		if _, err := exec.LookPath(candidate); err == nil {
 			return []string{candidate}
 		}
 	}
-	// Fall back to whatever we captured from /proc -- still useful for
-	// apps whose app_id doesn't cleanly map to a binary name, even though
-	// it carries the Nix-store fragility risk described above. A future
+
+	// Last resort -- still carries the risks described above. A future
 	// phase (Part 11 / Application Providers) is the right place for a
 	// user-configurable override map, similar to nirinit's `launch` config
-	// section, for the cases this heuristic can't resolve.
+	// section, for the cases none of the above can resolve.
 	return procCmdline
+}
+
+// sanitizeNixStorePath guards against the exact NixOS fragility problem
+// this project has already hit once (see the raw-cmdline case above),
+// showing up again through a different source: confirmed that on NixOS,
+// a .desktop file's Exec= line can itself bake in a raw, versioned Nix
+// store path (e.g. "/nix/store/f0328rw.../bin/ghostty"), which becomes
+// invalid the moment a system rebuild changes that package's derivation
+// hash -- exactly as fragile as the /proc/cmdline case, just from a
+// different source. If argv[0] looks like a Nix store path, try the
+// plain basename ("ghostty") via $PATH first; only keep the absolute
+// path if the plain name doesn't resolve at all.
+func sanitizeNixStorePath(cmd []string) []string {
+	if len(cmd) == 0 || !strings.HasPrefix(cmd[0], "/nix/store/") {
+		return cmd
+	}
+	base := filepath.Base(cmd[0])
+	if _, err := exec.LookPath(base); err == nil {
+		sanitized := append([]string{base}, cmd[1:]...)
+		return sanitized
+	}
+	// Not resolvable via $PATH -- keep the absolute path as a last resort,
+	// since something (even if fragile) is better than nothing.
+	return cmd
 }
 
 // commandNameFromAppID applies a simple heuristic: many app_ids follow

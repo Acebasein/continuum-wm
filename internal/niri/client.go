@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 )
 
 // Client talks to niri exclusively via the `niri msg` CLI wrapper around
@@ -115,6 +114,24 @@ func (c *Client) MoveWindowToWorkspace(ctx context.Context, windowID uint64, ref
 // default. $HOME is at least predictable and doesn't depend on where the
 // tool is invoked from, which also matters once this runs as a background
 // daemon (Part 18) rather than something launched by hand from a shell.
+//
+// THE COMMAND IS WRAPPED WITH `setsid --fork --`. WHY THIS MATTERS,
+// confirmed via real testing: some NixOS packages (confirmed with
+// ONLYOFFICE) are distributed as a sandboxed FHS environment launched
+// through bubblewrap with the flag --die-with-parent -- meaning the
+// kernel kills the ENTIRE sandboxed process tree the instant its direct
+// spawning parent exits. Our own syscall.Setsid (see detachedSysProcAttr)
+// changes the new process's SESSION, but does not change which process
+// bubblewrap is watching for this purpose -- continuum-cli itself remains
+// that parent, so the app would open correctly and then be killed the
+// moment continuum-cli's own process exited, which looked exactly like a
+// silent crash until traced. `setsid --fork` genuinely forks an
+// intermediary that exits immediately, so by the time the real
+// application (and anything like bubblewrap underneath it) starts
+// running, continuum-cli was never its parent at all. This is a general
+// fix, not an ONLYOFFICE-specific one -- other NixOS packages using the
+// same bwrap/--die-with-parent pattern (common for apps needing a fake
+// FHS filesystem) would hit the identical bug.
 func LaunchDetached(command []string, workDir string) (pid int32, err error) {
 	if len(command) == 0 {
 		return 0, fmt.Errorf("empty launch command")
@@ -127,12 +144,16 @@ func LaunchDetached(command []string, workDir string) (pid int32, err error) {
 		// unset below -- falling back to default inherited behavior as a
 		// last resort, rather than failing the whole launch over it.
 	}
-	cmd := exec.Command(command[0], command[1:]...)
+
+	wrapped := append([]string{"setsid", "--fork", "--"}, command...)
+	cmd := exec.Command(wrapped[0], wrapped[1:]...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Dir = workDir
-	cmd.SysProcAttr = detachedSysProcAttr()
+	// No SysProcAttr.Setsid here -- `setsid --fork` already handles full
+	// session detachment; adding our own on top is redundant at best and
+	// avoided for clarity, not because it was confirmed harmful.
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("starting %v: %w", command, err)
@@ -144,14 +165,6 @@ func LaunchDetached(command []string, workDir string) (pid int32, err error) {
 	go cmd.Wait()
 
 	return int32(cmd.Process.Pid), nil
-}
-
-// detachedSysProcAttr configures the launched process to start its own
-// session (Setsid), detaching it from continuum-cli's process group. This
-// is Linux-specific but that's fine -- Continuum-WM's Niri backend only
-// ever runs on Linux.
-func detachedSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setsid: true}
 }
 
 // subprocess and returns a channel of parsed events plus a channel of
