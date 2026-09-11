@@ -1,0 +1,65 @@
+# continuum-wm.service -- systemd --user unit for Continuum-WM's lazy
+# restore daemon.
+#
+# This unit runs `continuum-cli lazy-restore <path>` continuously: it
+# restores the favorite workspace immediately, restores every other saved
+# workspace the first time you navigate to it, and auto-captures the
+# session every 5 minutes (see internal/session and cmd/continuum-cli in
+# the repo for the actual logic -- this unit is pure packaging, no new
+# behavior).
+#
+# IMPORTANT, READ BEFORE ENABLING:
+#
+#   This service needs WAYLAND_DISPLAY and NIRI_SOCKET in its environment
+#   to talk to niri at all. A systemd --user session does NOT automatically
+#   inherit these from your graphical session on every setup -- whether it
+#   does depends on your display manager / login flow. If this service
+#   fails immediately with a connection error (check with `journalctl
+#   --user -u continuum-wm -e`), you need niri itself to export these
+#   variables into the user systemd environment at startup. Add this line
+#   to your niri config (adjust to taste):
+#
+#     spawn-at-startup "dbus-update-activation-environment" "--systemd" "DISPLAY" "WAYLAND_DISPLAY" "NIRI_SOCKET" "XDG_CURRENT_DESKTOP"
+#
+#   This is a common, well-established pattern for Wayland compositors
+#   under systemd --user sessions -- not something specific to
+#   Continuum-WM. Verify it worked with:
+#     systemctl --user show-environment | grep -E 'WAYLAND_DISPLAY|NIRI_SOCKET'
+#
+# INSTALL PATH: place this file at ~/.config/systemd/user/continuum-wm.service
+
+[Unit]
+Description=Continuum-WM lazy session restore daemon
+Documentation=https://github.com/YOUR-USERNAME/continuum-wm
+# Only start once the graphical session (niri) is actually up -- starting
+# before niri exists would just fail to connect, uselessly.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+
+# Adjust these two paths if you installed the binary or keep your session
+# file somewhere else. %h expands to your home directory.
+ExecStart=%h/.local/bin/continuum-cli lazy-restore %h/.local/state/continuum-wm/session.yaml
+
+# Restart policy: a SEPARATE, coarser safety net from the one-retry logic
+# already built into individual entity restores (Part 13/15 of the design
+# doc) -- this handles the whole PROCESS crashing outright (a real crash,
+# not just one app timing out), not routine per-app failures. Capped, not
+# infinite: if something is fundamentally broken, retrying forever every
+# few seconds would just spam the log without ever succeeding.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# All of continuum-cli's normal output (restore traces, auto-capture
+# confirmations, warnings) goes to stdout/stderr already -- journald
+# captures this for free, no extra logging setup needed. View it with:
+#   journalctl --user -u continuum-wm -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

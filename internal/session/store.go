@@ -17,8 +17,27 @@ import (
 	"continuum-wm/internal/procinfo"
 )
 
-// Save writes the session to path as YAML. It always updates UpdatedAt
-// before writing.
+// Save writes the session to path as YAML, atomically, and keeps one
+// previous generation as a manual fallback.
+//
+// ATOMICITY: writes to a temp file in the same directory first, then
+// renames it over path. A rename within the same filesystem is atomic on
+// Linux -- the file at path is ALWAYS either the complete previous
+// version or the complete new version, never a half-written one, even if
+// this process is killed mid-write. This is what makes an explicit
+// "capture completed successfully" flag in the schema unnecessary: the
+// file's mere existence at a stable path already carries that guarantee
+// structurally, rather than as a field a reader could misread or a writer
+// could forget to set.
+//
+// PREVIOUS GENERATION: before the atomic rename, if a file already exists
+// at path, it's preserved as path+".previous" (overwriting whatever was
+// there before). This covers a DIFFERENT risk than atomicity: a capture
+// can be perfectly well-formed YAML and still reflect a bad moment in
+// time (e.g. a transient niri IPC hiccup returning stale/incomplete data)
+// -- atomicity alone wouldn't protect against confidently overwriting a
+// good session with a valid-but-wrong one. Keeping one generation back
+// gives a manual recovery path (`cp path.previous path`) for that case.
 func Save(s *Session, path string) error {
 	s.UpdatedAt = time.Now().UTC()
 
@@ -27,12 +46,61 @@ func Save(s *Session, path string) error {
 		return fmt.Errorf("marshaling session to YAML: %w", err)
 	}
 
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file for atomic write: %w", err)
+	}
+	tmpPath := tmp.Name()
+	// If anything below fails before the final rename, clean up the temp
+	// file rather than leaving it behind -- os.Remove on an already-
+	// renamed-away path is a harmless no-op error, ignored deliberately.
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp session file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("syncing temp session file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp session file: %w", err)
+	}
 	// 0600: session files can reveal working directories, open documents,
-	// etc. -- treat them as user-private by default.
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("writing session file %s: %w", path, err)
+	// etc. -- treat them as user-private by default. CreateTemp defaults
+	// to 0600 already, but set it explicitly rather than rely on that.
+	if err := os.Chmod(tmpPath, 0600); err != nil {
+		return fmt.Errorf("setting permissions on temp session file: %w", err)
+	}
+
+	// Preserve the previous generation, best-effort -- if path doesn't
+	// exist yet (first-ever capture), this is expected to fail and is not
+	// treated as an error.
+	if _, err := os.Stat(path); err == nil {
+		_ = os.Rename(path, path+".previous")
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("renaming temp session file into place: %w", err)
 	}
 	return nil
+}
+
+// IsEmpty reports whether s has zero entities across every workspace --
+// used by the auto-capture loop (see cmd/continuum-cli) to avoid
+// overwriting a known-good session with an accidentally empty one from a
+// transient niri IPC glitch. Not used by the explicit `capture` command,
+// which should always honor exactly what the user asked for, empty or
+// not.
+func (s *Session) IsEmpty() bool {
+	for _, ws := range s.Workspaces {
+		if len(ws.Entities) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Load reads and parses a session file. It rejects files with a schema
@@ -71,18 +139,83 @@ func Load(path string) (*Session, error) {
 //
 // Per niri's own IPC documentation, a separate Workspaces() call and a
 // separate Windows() call are not guaranteed to be perfectly consistent
-// with each other (state can change in between). CaptureLive does its best
-// to associate windows with the workspaces list it just read, but treat
-// this capture as best-effort, matching the same caveat noted in
-// internal/niri/client.go.
+// with each other (state can change in between). CONFIRMED via real
+// testing that this isn't just a theoretical risk: during a long-running
+// daemon session with heavy restore activity across two monitors, a
+// window's WorkspaceID referenced a workspace that no longer appeared in
+// the just-fetched workspace list (almost certainly renumbered/recreated
+// in the gap between the two calls) -- the OLD version of this function
+// silently dropped such windows entirely, with no warning at all, since it
+// only ever visits windows through a per-known-workspace lookup. This
+// caused real data loss: apps that were captured correctly one cycle
+// vanished from the very next auto-capture, despite still running.
+//
+// Fixed by detecting this inconsistency (an "orphaned" window whose
+// WorkspaceID matches no workspace in this capture) and retrying the
+// whole two-query capture once -- a fresh pair of queries is likely to
+// land consistently. If orphans are STILL present after the retry, they
+// are preserved (not silently dropped) under a clearly-marked recovery
+// workspace, with a warning printed, so the person running this can see
+// something is off rather than silently losing data.
 func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
+	const maxAttempts = 2
+	var s *Session
+	var orphaned []niri.Window
+	var err error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		s, orphaned, err = captureOnce(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		if len(orphaned) == 0 {
+			return s, nil
+		}
+		if attempt < maxAttempts {
+			fmt.Printf("  (capture: %d window(s) referenced a workspace not in this snapshot -- retrying capture once)\n", len(orphaned))
+		}
+	}
+
+	// Still inconsistent after a retry -- preserve the orphaned windows
+	// rather than silently losing them, and say so plainly.
+	fmt.Printf("  (capture: %d window(s) still could not be attributed to any workspace after retrying -- preserving them under a recovery workspace)\n", len(orphaned))
+	recovery := Workspace{
+		PersistentID: idgen.New("ws-recovery"),
+		OutputHint:   "",
+		IdxHint:      0,
+	}
+	for _, win := range orphaned {
+		if win.AppID == nil || *win.AppID == "" {
+			continue
+		}
+		ent := Entity{
+			PersistentID: idgen.New("ent"),
+			AppID:        *win.AppID,
+			LastSeen:     LastSeen{NiriWindowID: win.ID, CapturedAt: time.Now().UTC()},
+		}
+		if win.Title != nil {
+			ent.Title = *win.Title
+		}
+		recovery.Entities = append(recovery.Entities, ent)
+	}
+	if len(recovery.Entities) > 0 {
+		s.Workspaces = append(s.Workspaces, recovery)
+	}
+	return s, nil
+}
+
+// captureOnce performs a single capture attempt, returning both the
+// resulting Session and any windows that couldn't be attributed to a
+// workspace in this same attempt (see CaptureLive's doc comment for why
+// that can happen).
+func captureOnce(ctx context.Context, client *niri.Client) (*Session, []niri.Window, error) {
 	niriWorkspaces, err := client.Workspaces(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reading workspaces: %w", err)
+		return nil, nil, fmt.Errorf("reading workspaces: %w", err)
 	}
 	niriWindows, err := client.Windows(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reading windows: %w", err)
+		return nil, nil, fmt.Errorf("reading windows: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -100,6 +233,11 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 		Compositor:    "niri",
 	}
 
+	validWorkspaceIDs := make(map[uint64]bool, len(niriWorkspaces))
+	for _, nw := range niriWorkspaces {
+		validWorkspaceIDs[nw.ID] = true
+	}
+
 	// Index windows by their niri workspace_id so we can group them.
 	windowsByWorkspace := make(map[uint64][]niri.Window)
 	// Count how many windows share each PID. A PID shared by more than one
@@ -110,9 +248,16 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 	// capture safe by construction: it doesn't need to know in advance
 	// which apps share processes, it discovers it from the live data.
 	windowCountByPID := make(map[int32]int)
+	var orphaned []niri.Window
 	for _, w := range niriWindows {
 		if w.WorkspaceID == nil {
 			continue // a window with no workspace isn't something we can place; skip rather than guess
+		}
+		if !validWorkspaceIDs[*w.WorkspaceID] {
+			// This window's workspace disappeared between the Workspaces()
+			// and Windows() calls above -- see CaptureLive's doc comment.
+			orphaned = append(orphaned, w)
+			continue
 		}
 		windowsByWorkspace[*w.WorkspaceID] = append(windowsByWorkspace[*w.WorkspaceID], w)
 		if w.PID != nil {
@@ -169,7 +314,7 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 		s.Workspaces = append(s.Workspaces, ws)
 	}
 
-	return s, nil
+	return s, orphaned, nil
 }
 
 // resolveLaunchCommand decides what command to save for relaunching this

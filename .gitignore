@@ -1,2 +1,5 @@
 continuum-observe
 continuum-cli
+*-test*.yaml
+*.yaml.previous
+pre-reboot.yaml

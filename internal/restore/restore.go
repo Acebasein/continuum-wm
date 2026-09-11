@@ -18,6 +18,7 @@ package restore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"continuum-wm/internal/niri"
@@ -239,74 +240,54 @@ func resolveEntityLaunchCommand(ent session.Entity) []string {
 	return ent.Launch.Command
 }
 
-// Entity attempts to restore a single saved entity, using workspaceIdxHint
-// (the workspace's captured niri index) and outputHint (the workspace's
-// captured monitor name) together as the placement target.
+// attemptLaunchAndObserve performs ONE launch+observe+settle attempt for
+// ent: establishes a fresh baseline, launches the entity, waits for a
+// matching new window (Phase A), then briefly watches for any additional
+// competing windows (Phase B, the settle window -- see Entity's doc
+// comment). Returns the candidate window IDs observed, or an error
+// describing why this attempt failed.
 //
-// outputHint MATTERS, confirmed via real multi-monitor testing: a bare
-// idx reference is ambiguous when more than one monitor has a workspace
-// at that position (each monitor has its own independent, 1-indexed
-// stack). The fix is NOT to focus the target monitor first (that would
-// steal the user's visible focus, and niri's own docs' "resolves relative
-// to the focused monitor" wording turned out to describe only the
-// no-window-id default case) -- instead, confirmed experimentally that
-// when --window-id is given explicitly (as we always do), the idx
-// reference resolves against THAT WINDOW'S OWN current output. So the
-// fix is: explicitly move the window to the correct output FIRST (see
-// niri.Client.MoveWindowToMonitor), then the existing idx-based
-// MoveWindowToWorkspace call resolves correctly against it, with no
-// global focus changes at all.
-//
-// This function deliberately does the state transitions in a strict,
-// visible sequence -- each step is logged as it happens (via the returned
-// Result at each stage isn't streamed today; Phase 9 will add proper
-// structured logging. For now, callers should print progress themselves,
-// as continuum-cli's restore command does).
-func Entity(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, outputHint string, timeout time.Duration) Result {
-	if len(ent.Launch.Command) == 0 {
-		return Result{State: StateFailed, Reason: "no launch command was captured for this entity"}
-	}
-	if ent.AppID == "" {
-		return Result{State: StateFailed, Reason: "entity has no app_id -- refusing to guess how to match it"}
-	}
-
-	// --- Establish a baseline BEFORE launching, so we can tell a newly
+// Extracted out of Entity so it can be retried (see Entity's retry loop,
+// Part 13/15 of the design doc) -- each attempt gets its own fresh
+// baseline, event stream subscription, and timeout context, since a
+// second attempt after a timeout must not reuse a context that has
+// already expired.
+func attemptLaunchAndObserve(ctx context.Context, client *niri.Client, ent session.Entity, timeout time.Duration) ([]uint64, error) {
+	// Establish a baseline BEFORE launching, so we can tell a newly
 	// opened window apart from one that already existed. This directly
 	// implements the design doc's "sequential/transactional restoration"
 	// principle (Part 13): one entity at a time, launch-then-observe, not
 	// launch-everything-and-sort-it-out-after.
 	baseline, err := client.Windows(ctx)
 	if err != nil {
-		return Result{State: StateFailed, Reason: fmt.Sprintf("could not read baseline windows: %v", err)}
+		return nil, fmt.Errorf("could not read baseline windows: %w", err)
 	}
 	existingIDs := make(map[uint64]bool, len(baseline))
 	for _, w := range baseline {
 		existingIDs[w.ID] = true
 	}
 
-	// --- LAUNCHING ---
 	// If we have a saved CWD for this entity, pass it through explicitly
 	// (see niri.LaunchDetached) rather than letting the new process
 	// inherit continuum-cli's own directory -- confirmed experimentally
 	// that without this, every restored terminal silently opened wherever
 	// continuum-cli itself was run from, regardless of each entity's
-	// actual saved directory. The CWD verification step further below
-	// remains as a secondary safety net (e.g. for entities where this
-	// isn't applicable, or to catch a genuine matching error), not the
-	// primary mechanism for getting the directory right.
+	// actual saved directory. The CWD verification step further below in
+	// Entity remains as a secondary safety net (e.g. for entities where
+	// this isn't applicable, or to catch a genuine matching error), not
+	// the primary mechanism for getting the directory right.
 	obsCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	events, errs, err := client.EventStream(obsCtx)
 	if err != nil {
-		return Result{State: StateFailed, Reason: fmt.Sprintf("could not start event stream: %v", err)}
+		return nil, fmt.Errorf("could not start event stream: %w", err)
 	}
 
 	if _, err := niri.LaunchDetached(resolveEntityLaunchCommand(ent), ent.ProviderMetadata.CWD); err != nil {
-		return Result{State: StateFailed, Reason: fmt.Sprintf("launch failed: %v", err)}
+		return nil, fmt.Errorf("launch failed: %w", err)
 	}
 
-	// --- OBSERVING / MATCHED ---
 	// Phase 4: rather than committing to the FIRST qualifying window we
 	// see (Phase 3's behavior, which is vulnerable to a race -- e.g. the
 	// user manually opens a second window of the same app_id during our
@@ -334,7 +315,7 @@ waitForFirst:
 		select {
 		case ev, ok := <-events:
 			if !ok {
-				return Result{State: StateFailed, Reason: "event stream closed before a matching window appeared"}
+				return nil, fmt.Errorf("event stream closed before a matching window appeared")
 			}
 			if ev.Kind == niri.EventWindowOpenedOrChanged {
 				collectCandidate(ev.WindowOpenedOrChanged.Window)
@@ -349,7 +330,7 @@ waitForFirst:
 			}
 
 		case <-obsCtx.Done():
-			return Result{State: StateFailed, Reason: fmt.Sprintf("timed out after %s waiting for app_id=%q to appear", timeout, ent.AppID)}
+			return nil, fmt.Errorf("timed out after %s waiting for app_id=%q to appear", timeout, ent.AppID)
 		}
 	}
 
@@ -382,12 +363,78 @@ settleLoop:
 		}
 	}
 
+	return candidates, nil
+}
+
+// Entity attempts to restore a single saved entity, using workspaceIdxHint
+// (the workspace's captured niri index) and outputHint (the workspace's
+// captured monitor name) together as the placement target.
+//
+// outputHint MATTERS, confirmed via real multi-monitor testing: a bare
+// idx reference is ambiguous when more than one monitor has a workspace
+// at that position (each monitor has its own independent, 1-indexed
+// stack). The fix is NOT to focus the target monitor first (that would
+// steal the user's visible focus, and niri's own docs' "resolves relative
+// to the focused monitor" wording turned out to describe only the
+// no-window-id default case) -- instead, confirmed experimentally that
+// when --window-id is given explicitly (as we always do), the idx
+// reference resolves against THAT WINDOW'S OWN current output. So the
+// fix is: explicitly move the window to the correct output FIRST (see
+// niri.Client.MoveWindowToMonitor), then the existing idx-based
+// MoveWindowToWorkspace call resolves correctly against it, with no
+// global focus changes at all.
+//
+// This function deliberately does the state transitions in a strict,
+// visible sequence -- each step is logged as it happens (via the returned
+// Result at each stage isn't streamed today; Phase 9 will add proper
+// structured logging. For now, callers should print progress themselves,
+// as continuum-cli's restore command does).
+func Entity(ctx context.Context, client *niri.Client, ent session.Entity, workspaceIdxHint uint8, outputHint string, timeout time.Duration) Result {
+	if len(ent.Launch.Command) == 0 {
+		return Result{State: StateFailed, Reason: "no launch command was captured for this entity"}
+	}
+	if ent.AppID == "" {
+		return Result{State: StateFailed, Reason: "entity has no app_id -- refusing to guess how to match it"}
+	}
+
+	// --- LAUNCHING / OBSERVING, with one retry on timeout ---
+	// Part 13/15 of the design doc: a single retry for a launch/observe
+	// timeout is reasonable -- the app may simply be slow to start,
+	// especially under load. CONFIRMED via real batch-restore testing:
+	// Firefox and ONLYOFFICE both timed out at least once in a large
+	// restore-all run, yet opened successfully when restored individually
+	// afterward -- consistent with a load/timing issue, not a permanent
+	// failure. Retrying indefinitely would be the wrong response to a
+	// genuinely broken entity (missing binary, bad launch command), so
+	// this is capped at exactly one retry, not open-ended.
+	const maxAttempts = 2
+	var candidates []uint64
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var err error
+		candidates, err = attemptLaunchAndObserve(ctx, client, ent, timeout)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		if attempt < maxAttempts && strings.Contains(err.Error(), "timed out") {
+			fmt.Printf("  attempt %d timed out waiting for app_id=%q -- retrying once\n", attempt, ent.AppID)
+			continue
+		}
+		break // non-timeout failure, or out of retries -- give up
+	}
+	if lastErr != nil {
+		return Result{State: StateFailed, Reason: lastErr.Error()}
+	}
+
 	var matchedID uint64
 	switch len(candidates) {
 	case 0:
-		// Shouldn't happen (Phase A guarantees at least one), but handle
-		// defensively rather than silently proceeding with a zero-value ID.
-		return Result{State: StateFailed, Reason: "internal error: no candidates recorded despite exiting the wait phase"}
+		// Shouldn't happen (attemptLaunchAndObserve guarantees at least
+		// one on success), but handle defensively rather than silently
+		// proceeding with a zero-value ID.
+		return Result{State: StateFailed, Reason: "internal error: no candidates recorded despite a successful observe phase"}
 
 	case 1:
 		matchedID = candidates[0]
