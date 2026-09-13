@@ -28,6 +28,42 @@ func (c *Client) bin() string {
 	return c.NiriBin
 }
 
+// Output mirrors the relevant fields of niri-ipc's Output struct.
+// Confirmed via real `niri msg --json outputs` output that the top-level
+// JSON is an OBJECT keyed by output name (e.g. {"eDP-2": {...}}), not an
+// array like Workspaces/Windows -- different shape, handled accordingly
+// in Outputs() below.
+type Output struct {
+	Name    string         `json:"name"`
+	Logical *LogicalRegion `json:"logical"`
+}
+
+// LogicalRegion is an output's logical (post-scale) position and size --
+// the numbers that matter for our width/height fraction math, confirmed
+// experimentally to match what niri's own set-column-width/
+// set-window-height percentage arguments are computed against.
+type LogicalRegion struct {
+	X      int     `json:"x"`
+	Y      int     `json:"y"`
+	Width  int     `json:"width"`
+	Height int     `json:"height"`
+	Scale  float64 `json:"scale"`
+}
+
+// Outputs runs `niri msg --json outputs` and returns a map keyed by output
+// name (e.g. "eDP-2", "HDMI-A-3").
+func (c *Client) Outputs(ctx context.Context) (map[string]Output, error) {
+	out, err := exec.CommandContext(ctx, c.bin(), "msg", "--json", "outputs").Output()
+	if err != nil {
+		return nil, fmt.Errorf("niri msg --json outputs: %w", err)
+	}
+	var outputs map[string]Output
+	if err := json.Unmarshal(out, &outputs); err != nil {
+		return nil, fmt.Errorf("parsing outputs JSON: %w", err)
+	}
+	return outputs, nil
+}
+
 // Workspaces runs `niri msg --json workspaces` once and returns the result.
 //
 // NOTE: niri's own IPC documentation warns that separate requests like
@@ -92,6 +128,76 @@ func (c *Client) MoveWindowToMonitor(ctx context.Context, windowID uint64, outpu
 	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("niri msg action move-window-to-monitor failed: %w (output: %s)", err, string(out))
+	}
+	return nil
+}
+
+// ConsumeWindowIntoColumn consumes the window immediately to the right of
+// the FOCUSED column into that column. CONFIRMED VIA REAL TESTING: this
+// action has NO targeting option whatsoever -- not even the --id-less
+// "acts on focused window" pattern SetColumnWidth uses; it operates purely
+// on "whatever column is focused" + "whatever window is immediately to
+// its right." Callers MUST verify live adjacency (via each window's
+// pos_in_scrolling_layout) immediately before calling this, and must be
+// prepared to NOT call it at all if adjacency can't be confirmed --
+// guessing here risks silently merging the wrong window into a column.
+func (c *Client) ConsumeWindowIntoColumn(ctx context.Context) error {
+	out, err := exec.CommandContext(ctx, c.bin(), "msg", "action", "consume-window-into-column").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("niri msg action consume-window-into-column failed: %w (output: %s)", err, string(out))
+	}
+	return nil
+}
+
+// FocusWindow focuses the window with the given id. Confirmed necessary
+// as a prerequisite for SetColumnWidth (see its doc comment) -- niri has
+// no --id/--window-id option on set-column-width at all, unlike most
+// other window-targeting actions, so focus is the ONLY way to target a
+// specific column for width changes.
+func (c *Client) FocusWindow(ctx context.Context, windowID uint64) error {
+	args := []string{"msg", "action", "focus-window", "--id", fmt.Sprintf("%d", windowID)}
+	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("niri msg action focus-window failed: %w (output: %s)", err, string(out))
+	}
+	return nil
+}
+
+// SetColumnWidth changes the width of the FOCUSED column. change is
+// passed through verbatim to niri (e.g. "50%" for a proportional width,
+// or a bare number like "960" for a fixed pixel width) -- confirmed via
+// niri's own documentation that these two forms are NOT interchangeable
+// (proportional sizing includes the tile's border in the calculation,
+// fixed-pixel sizing does not).
+//
+// CRITICAL, CONFIRMED VIA REAL TESTING: this action has NO window/column
+// targeting option whatsoever -- unlike SetWindowHeight below, there is
+// no --id here. It ALWAYS affects whatever column currently has focus,
+// regardless of caller intent. Callers MUST call FocusWindow on a window
+// in the intended column immediately before calling this, and should
+// restore whatever was focused before once done, to avoid leaving the
+// user's visible focus somewhere they didn't put it.
+func (c *Client) SetColumnWidth(ctx context.Context, change string) error {
+	args := []string{"msg", "action", "set-column-width", change}
+	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("niri msg action set-column-width failed: %w (output: %s)", err, string(out))
+	}
+	return nil
+}
+
+// SetWindowHeight changes the height of the window with the given id.
+// change follows the same "50%" vs fixed-pixel-number rules as
+// SetColumnWidth's change parameter.
+//
+// CONFIRMED VIA REAL TESTING: unlike SetColumnWidth, this action's --id
+// option genuinely targets the specified window independent of which
+// window currently has focus -- no focus-stealing needed here at all.
+func (c *Client) SetWindowHeight(ctx context.Context, windowID uint64, change string) error {
+	args := []string{"msg", "action", "set-window-height", "--id", fmt.Sprintf("%d", windowID), change}
+	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("niri msg action set-window-height failed: %w (output: %s)", err, string(out))
 	}
 	return nil
 }

@@ -18,6 +18,7 @@ package restore
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -240,19 +241,35 @@ func resolveEntityLaunchCommand(ent session.Entity) []string {
 	return ent.Launch.Command
 }
 
+// processAlive reports whether pid still exists, checked via /proc. Used
+// only to decide whether a retry should relaunch a new process or simply
+// wait longer for one that's already running and might just be slow --
+// see the fixed regression described in Entity's retry loop.
+func processAlive(pid int32) bool {
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
+}
+
 // attemptLaunchAndObserve performs ONE launch+observe+settle attempt for
-// ent: establishes a fresh baseline, launches the entity, waits for a
-// matching new window (Phase A), then briefly watches for any additional
-// competing windows (Phase B, the settle window -- see Entity's doc
-// comment). Returns the candidate window IDs observed, or an error
-// describing why this attempt failed.
+// ent: establishes a fresh baseline, launches the entity (unless
+// skipLaunch is true), waits for a matching new window (Phase A), then
+// briefly watches for any additional competing windows (Phase B, the
+// settle window -- see Entity's doc comment). Returns the candidate
+// window IDs observed, the PID of whichever process is now considered
+// "the launch" (either freshly spawned, or previousPID if skipLaunch was
+// true), and an error describing why this attempt failed, if any.
 //
-// Extracted out of Entity so it can be retried (see Entity's retry loop,
-// Part 13/15 of the design doc) -- each attempt gets its own fresh
-// baseline, event stream subscription, and timeout context, since a
-// second attempt after a timeout must not reuse a context that has
-// already expired.
-func attemptLaunchAndObserve(ctx context.Context, client *niri.Client, ent session.Entity, timeout time.Duration) ([]uint64, error) {
+// skipLaunch/previousPID exist specifically to fix a CONFIRMED real bug:
+// the original retry logic always spawned a brand-new process on retry,
+// assuming a timeout meant the app had failed to start. But under real
+// load (e.g. right after a reboot), the ORIGINAL process was often just
+// slow, not dead -- both it and the retry's new process would eventually
+// succeed, leaving a genuine, permanent duplicate window that Reconcile
+// has no way to clean up afterward (confirmed directly: duplicated
+// Firefox/Nautilus/PDF Arranger windows during a restore-all run). Entity
+// now checks whether previousPID is still alive before deciding to
+// relaunch at all -- see processAlive.
+func attemptLaunchAndObserve(ctx context.Context, client *niri.Client, ent session.Entity, timeout time.Duration, skipLaunch bool, previousPID int32) ([]uint64, int32, error) {
 	// Establish a baseline BEFORE launching, so we can tell a newly
 	// opened window apart from one that already existed. This directly
 	// implements the design doc's "sequential/transactional restoration"
@@ -260,7 +277,7 @@ func attemptLaunchAndObserve(ctx context.Context, client *niri.Client, ent sessi
 	// launch-everything-and-sort-it-out-after.
 	baseline, err := client.Windows(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("could not read baseline windows: %w", err)
+		return nil, previousPID, fmt.Errorf("could not read baseline windows: %w", err)
 	}
 	existingIDs := make(map[uint64]bool, len(baseline))
 	for _, w := range baseline {
@@ -281,11 +298,16 @@ func attemptLaunchAndObserve(ctx context.Context, client *niri.Client, ent sessi
 
 	events, errs, err := client.EventStream(obsCtx)
 	if err != nil {
-		return nil, fmt.Errorf("could not start event stream: %w", err)
+		return nil, previousPID, fmt.Errorf("could not start event stream: %w", err)
 	}
 
-	if _, err := niri.LaunchDetached(resolveEntityLaunchCommand(ent), ent.ProviderMetadata.CWD); err != nil {
-		return nil, fmt.Errorf("launch failed: %w", err)
+	launchedPID := previousPID
+	if !skipLaunch {
+		pid, err := niri.LaunchDetached(resolveEntityLaunchCommand(ent), ent.ProviderMetadata.CWD)
+		if err != nil {
+			return nil, previousPID, fmt.Errorf("launch failed: %w", err)
+		}
+		launchedPID = pid
 	}
 
 	// Phase 4: rather than committing to the FIRST qualifying window we
@@ -315,7 +337,7 @@ waitForFirst:
 		select {
 		case ev, ok := <-events:
 			if !ok {
-				return nil, fmt.Errorf("event stream closed before a matching window appeared")
+				return nil, launchedPID, fmt.Errorf("event stream closed before a matching window appeared")
 			}
 			if ev.Kind == niri.EventWindowOpenedOrChanged {
 				collectCandidate(ev.WindowOpenedOrChanged.Window)
@@ -330,7 +352,7 @@ waitForFirst:
 			}
 
 		case <-obsCtx.Done():
-			return nil, fmt.Errorf("timed out after %s waiting for app_id=%q to appear", timeout, ent.AppID)
+			return nil, launchedPID, fmt.Errorf("timed out after %s waiting for app_id=%q to appear", timeout, ent.AppID)
 		}
 	}
 
@@ -363,7 +385,7 @@ settleLoop:
 		}
 	}
 
-	return candidates, nil
+	return candidates, launchedPID, nil
 }
 
 // Entity attempts to restore a single saved entity, using workspaceIdxHint
@@ -407,19 +429,38 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 	// failure. Retrying indefinitely would be the wrong response to a
 	// genuinely broken entity (missing binary, bad launch command), so
 	// this is capped at exactly one retry, not open-ended.
+	//
+	// FIXED REGRESSION, confirmed via real testing: the original version
+	// of this loop always launched a brand-new process on retry, on the
+	// assumption that a timeout meant the app had failed to start. Under
+	// real load (confirmed: right after a reboot), the ORIGINAL process
+	// was often just slow, not dead -- both it and the retry's new
+	// process eventually succeeded, leaving a genuine, permanent
+	// duplicate window with no way for Reconcile to clean it up
+	// afterward. Now: before relaunching, check whether the PID from the
+	// previous attempt is still alive (see processAlive). If it is, don't
+	// launch anything new -- just keep observing, since the app may
+	// simply need more time. Only launch a genuinely new process if the
+	// original one has actually exited.
 	const maxAttempts = 2
 	var candidates []uint64
 	var lastErr error
+	var launchedPID int32
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		skipLaunch := attempt > 1 && launchedPID != 0 && processAlive(launchedPID)
+		if skipLaunch {
+			fmt.Printf("  attempt %d: original process (pid=%d) is still running -- waiting longer instead of relaunching\n", attempt, launchedPID)
+		}
+
 		var err error
-		candidates, err = attemptLaunchAndObserve(ctx, client, ent, timeout)
+		candidates, launchedPID, err = attemptLaunchAndObserve(ctx, client, ent, timeout, skipLaunch, launchedPID)
 		if err == nil {
 			lastErr = nil
 			break
 		}
 		lastErr = err
 		if attempt < maxAttempts && strings.Contains(err.Error(), "timed out") {
-			fmt.Printf("  attempt %d timed out waiting for app_id=%q -- retrying once\n", attempt, ent.AppID)
+			fmt.Printf("  attempt %d timed out waiting for app_id=%q -- retrying\n", attempt, ent.AppID)
 			continue
 		}
 		break // non-timeout failure, or out of retries -- give up

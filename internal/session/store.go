@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -96,8 +97,10 @@ func Save(s *Session, path string) error {
 // not.
 func (s *Session) IsEmpty() bool {
 	for _, ws := range s.Workspaces {
-		if len(ws.Entities) > 0 {
-			return false
+		for _, col := range ws.Columns {
+			if len(col.Entities) > 0 {
+				return false
+			}
 		}
 	}
 	return true
@@ -184,6 +187,7 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 		OutputHint:   "",
 		IdxHint:      0,
 	}
+	recoveryCol := Column{PersistentID: idgen.New("col-recovery")}
 	for _, win := range orphaned {
 		if win.AppID == nil || *win.AppID == "" {
 			continue
@@ -196,9 +200,10 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 		if win.Title != nil {
 			ent.Title = *win.Title
 		}
-		recovery.Entities = append(recovery.Entities, ent)
+		recoveryCol.Entities = append(recoveryCol.Entities, ent)
 	}
-	if len(recovery.Entities) > 0 {
+	if len(recoveryCol.Entities) > 0 {
+		recovery.Columns = append(recovery.Columns, recoveryCol)
 		s.Workspaces = append(s.Workspaces, recovery)
 	}
 	return s, nil
@@ -216,6 +221,14 @@ func captureOnce(ctx context.Context, client *niri.Client) (*Session, []niri.Win
 	niriWindows, err := client.Windows(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading windows: %w", err)
+	}
+	// Outputs are used only for width/height fraction math (Phase 7) --
+	// best-effort. If this fails, fractions simply come back nil (the
+	// honest "don't guess" outcome), not a reason to fail the whole
+	// capture.
+	niriOutputs, outputsErr := client.Outputs(ctx)
+	if outputsErr != nil {
+		niriOutputs = nil
 	}
 
 	now := time.Now().UTC()
@@ -275,46 +288,130 @@ func captureOnce(ctx context.Context, client *niri.Client) (*Session, []niri.Win
 			ws.OutputHint = *nw.Output
 		}
 
+		// Look up this workspace's output logical dimensions, once, for
+		// use by every column/entity in it below. A missing/unreadable
+		// output means every fraction in this workspace comes back nil --
+		// never guessed.
+		var outputWidth, outputHeight float64
+		haveOutputDims := false
+		if niriOutputs != nil && ws.OutputHint != "" {
+			if out, ok := niriOutputs[ws.OutputHint]; ok && out.Logical != nil {
+				outputWidth = float64(out.Logical.Width)
+				outputHeight = float64(out.Logical.Height)
+				haveOutputDims = outputWidth > 0 && outputHeight > 0
+			}
+		}
+
+		// Group this workspace's windows by column. CONFIRMED (Phase 7
+		// research): pos_in_scrolling_layout is [column, row_in_column],
+		// 1-indexed. A nil PosInScrollingLayout (e.g. a floating window)
+		// gets its own synthetic single-window column, keyed by a
+		// negative value derived from its window ID, so it never
+		// collides with a real column index.
+		type colEntry struct {
+			key  int64
+			rows []niri.Window
+		}
+		columnsByKey := make(map[int64]*colEntry)
+		var columnOrder []int64
 		for _, win := range windowsByWorkspace[nw.ID] {
-			// Skip windows with no app_id at all -- Phase 1 showed us these
-			// are typically transient system popups, not real restorable
-			// application windows (see design doc discussion of the "som"
-			// / "Mount" windows observed during testing).
 			if win.AppID == nil || *win.AppID == "" {
+				// Skip windows with no app_id at all -- Phase 1 showed us
+				// these are typically transient system popups.
 				continue
 			}
+			var key int64
+			if win.Layout != nil && win.Layout.PosInScrollingLayout != nil {
+				key = int64(win.Layout.PosInScrollingLayout[0])
+			} else {
+				key = -int64(win.ID) // synthetic, guaranteed unique
+			}
+			ce, ok := columnsByKey[key]
+			if !ok {
+				ce = &colEntry{key: key}
+				columnsByKey[key] = ce
+				columnOrder = append(columnOrder, key)
+			}
+			ce.rows = append(ce.rows, win)
+		}
+		sort.Slice(columnOrder, func(i, j int) bool { return columnOrder[i] < columnOrder[j] })
 
-			ent := Entity{
-				PersistentID: idgen.New("ent"),
-				AppID:        *win.AppID,
-				LastSeen: LastSeen{
-					NiriWindowID: win.ID,
-					CapturedAt:   now,
-				},
+		for _, key := range columnOrder {
+			ce := columnsByKey[key]
+			// Order entities within the column by their captured row
+			// (top to bottom), so restore can replay them in the same
+			// sequence.
+			sort.Slice(ce.rows, func(i, j int) bool {
+				return rowOf(ce.rows[i]) < rowOf(ce.rows[j])
+			})
+
+			col := Column{
+				PersistentID: idgen.New("col"),
 			}
-			if win.Title != nil {
-				ent.Title = *win.Title
+			if key >= 0 {
+				col.ColumnIndex = int(key)
 			}
-			if win.PID != nil {
-				// Best-effort only -- see internal/procinfo. The PID is
-				// used here transiently and is never itself persisted.
-				var procCmdline []string
-				if cmd, err := procinfo.ReadCmdline(*win.PID); err == nil {
-					procCmdline = cmd
+
+			// Width is a property of the COLUMN, shared by every window in
+			// it (confirmed via real testing) -- derive it once, from the
+			// first window's tile size, rather than per-entity.
+			if haveOutputDims && len(ce.rows) > 0 {
+				first := ce.rows[0]
+				if first.Layout != nil && first.Layout.TileSize[0] > 0 {
+					f := first.Layout.TileSize[0] / outputWidth
+					col.WidthFraction = &f
 				}
-				ent.Launch.Command = resolveLaunchCommand(*win.AppID, procCmdline, desktopEntries)
-
-				cwd, confidence := resolveCWD(*win.AppID, *win.PID, windowCountByPID[*win.PID] > 1)
-				ent.ProviderMetadata.CWD = cwd
-				ent.ProviderMetadata.CWDConfidence = confidence
 			}
-			ws.Entities = append(ws.Entities, ent)
+
+			for i, win := range ce.rows {
+				ent := Entity{
+					PersistentID: idgen.New("ent"),
+					AppID:        *win.AppID,
+					RowInColumn:  i + 1,
+					LastSeen: LastSeen{
+						NiriWindowID: win.ID,
+						CapturedAt:   now,
+					},
+				}
+				if win.Title != nil {
+					ent.Title = *win.Title
+				}
+				if haveOutputDims && win.Layout != nil && win.Layout.TileSize[1] > 0 {
+					f := win.Layout.TileSize[1] / outputHeight
+					ent.HeightFraction = &f
+				}
+				if win.PID != nil {
+					// Best-effort only -- see internal/procinfo. The PID is
+					// used here transiently and is never itself persisted.
+					var procCmdline []string
+					if cmd, err := procinfo.ReadCmdline(*win.PID); err == nil {
+						procCmdline = cmd
+					}
+					ent.Launch.Command = resolveLaunchCommand(*win.AppID, procCmdline, desktopEntries)
+
+					cwd, confidence := resolveCWD(*win.AppID, *win.PID, windowCountByPID[*win.PID] > 1)
+					ent.ProviderMetadata.CWD = cwd
+					ent.ProviderMetadata.CWDConfidence = confidence
+				}
+				col.Entities = append(col.Entities, ent)
+			}
+
+			ws.Columns = append(ws.Columns, col)
 		}
 
 		s.Workspaces = append(s.Workspaces, ws)
 	}
 
 	return s, orphaned, nil
+}
+
+// rowOf returns a window's captured row-in-column (1-indexed), or 0 if it
+// has no scrolling-layout position at all (e.g. a floating window).
+func rowOf(w niri.Window) uint64 {
+	if w.Layout != nil && w.Layout.PosInScrollingLayout != nil {
+		return w.Layout.PosInScrollingLayout[1]
+	}
+	return 0
 }
 
 // resolveLaunchCommand decides what command to save for relaunching this

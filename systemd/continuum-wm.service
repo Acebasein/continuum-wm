@@ -36,6 +36,18 @@ Documentation=https://github.com/YOUR-USERNAME/continuum-wm
 After=graphical-session.target
 PartOf=graphical-session.target
 
+# Restart-loop rate limiting. CONFIRMED VIA REAL TESTING these belong here,
+# under [Unit], not under [Service] -- systemd logged "Unknown key
+# 'StartLimitIntervalSec' in section [Service], ignoring" and silently did
+# NOT enforce it, letting a genuinely broken config (e.g. a deleted
+# session file) crash-loop completely unthrottled -- 63 restart attempts
+# in about 5 minutes were observed before this was caught. If your
+# systemd version behaves differently, verify with
+# `systemctl --user status continuum-wm` after intentionally triggering a
+# failure, rather than trusting either placement blindly.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
 [Service]
 Type=simple
 
@@ -48,11 +60,23 @@ ExecStart=%h/.local/bin/continuum-cli lazy-restore %h/.local/state/continuum-wm/
 # doc) -- this handles the whole PROCESS crashing outright (a real crash,
 # not just one app timing out), not routine per-app failures. Capped, not
 # infinite: if something is fundamentally broken, retrying forever every
-# few seconds would just spam the log without ever succeeding.
+# few seconds would just spam the log without ever succeeding. See the
+# StartLimitIntervalSec/StartLimitBurst note under [Unit] above -- this
+# Restart= setting is meaningless without those actually being enforced.
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=3
+
+# CRITICAL, confirmed necessary via real testing: by default, systemd
+# kills an ENTIRE CGROUP on stop/restart, not just the main process. Every
+# app this daemon restores is a genuine child process of continuum-cli
+# (LaunchDetached's setsid --fork only detaches them into their own
+# SESSION, which does nothing about cgroup membership) -- so without this
+# setting, `systemctl stop`/`restart` on this service would silently kill
+# every restored application along with the daemon itself. Confirmed the
+# hard way: stopping the service closed live Firefox and Kitty windows
+# outright. KillMode=process restricts the kill signal to the main
+# continuum-cli process only, leaving everything it launched alone.
+KillMode=process
 
 # All of continuum-cli's normal output (restore traces, auto-capture
 # confirmations, warnings) goes to stdout/stderr already -- journald
