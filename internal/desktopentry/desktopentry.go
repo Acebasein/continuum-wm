@@ -32,6 +32,7 @@ type Entry struct {
 type Index struct {
 	byID      map[string]*Entry
 	byWMClass map[string]*Entry
+	all       []*Entry // deduplicated, for name-based search (SearchByName)
 }
 
 // Load scans the standard XDG application directories and builds an
@@ -64,6 +65,7 @@ func Load() *Index {
 			if entry.StartupWMClass != "" {
 				idx.byWMClass[entry.StartupWMClass] = entry
 			}
+			idx.all = append(idx.all, entry)
 		}
 	}
 	return idx
@@ -83,6 +85,42 @@ func (idx *Index) Lookup(appID string) *Entry {
 		return e
 	}
 	return nil
+}
+
+// SearchByName returns every desktop entry whose human-readable Name
+// (e.g. "Visual Studio Code") contains query as a case-insensitive
+// substring. Unlike Lookup, this searches by the FRIENDLY name, not the
+// app_id -- built specifically for suggesting a correct app_id when a
+// user types a plausible app name rather than its real identifier (e.g.
+// typing "dolphin" or "code" rather than "org.kde.dolphin" or "code").
+// Works for apps that aren't even running, since it reads installed
+// .desktop metadata directly rather than live window state.
+func (idx *Index) SearchByName(query string) []*Entry {
+	if query == "" {
+		return nil
+	}
+	lower := strings.ToLower(query)
+	var out []*Entry
+	for _, e := range idx.all {
+		if strings.Contains(strings.ToLower(e.Name), lower) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// AppID returns the identifier most likely to match niri's own reported
+// app_id for windows of this application: StartupWMClass when present
+// (that field exists specifically to record the expected window class),
+// falling back to the .desktop filename ID otherwise. This is a BEST
+// GUESS, not a guarantee -- confirmed elsewhere in this project that
+// app_id and .desktop naming can genuinely diverge (ONLYOFFICE) with no
+// fully reliable way to predict it without the app actually running.
+func (e *Entry) AppID() string {
+	if e.StartupWMClass != "" {
+		return e.StartupWMClass
+	}
+	return e.ID
 }
 
 // LaunchCommand returns a cleaned argv for this entry: standard Exec=

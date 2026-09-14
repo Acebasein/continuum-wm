@@ -15,6 +15,7 @@ import (
 	"continuum-wm/internal/desktopentry"
 	"continuum-wm/internal/idgen"
 	"continuum-wm/internal/niri"
+	"continuum-wm/internal/preferences"
 	"continuum-wm/internal/procinfo"
 )
 
@@ -161,13 +162,22 @@ func Load(path string) (*Session, error) {
 // workspace, with a warning printed, so the person running this can see
 // something is off rather than silently losing data.
 func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
+	// Load ignore-list preferences once per capture, best-effort. A
+	// preferences problem (missing file, unreadable) should never block
+	// core capture functionality -- fall back to an empty ignore list
+	// rather than failing the whole capture over it.
+	prefsPath, _ := preferences.DefaultPath()
+	prefs, err := preferences.Load(prefsPath)
+	if err != nil {
+		prefs = &preferences.Preferences{}
+	}
+
 	const maxAttempts = 2
 	var s *Session
 	var orphaned []niri.Window
-	var err error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		s, orphaned, err = captureOnce(ctx, client)
+		s, orphaned, err = captureOnce(ctx, client, prefs)
 		if err != nil {
 			return nil, err
 		}
@@ -192,6 +202,9 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 		if win.AppID == nil || *win.AppID == "" {
 			continue
 		}
+		if prefs.IsAppIgnored(*win.AppID) {
+			continue
+		}
 		ent := Entity{
 			PersistentID: idgen.New("ent"),
 			AppID:        *win.AppID,
@@ -213,7 +226,7 @@ func CaptureLive(ctx context.Context, client *niri.Client) (*Session, error) {
 // resulting Session and any windows that couldn't be attributed to a
 // workspace in this same attempt (see CaptureLive's doc comment for why
 // that can happen).
-func captureOnce(ctx context.Context, client *niri.Client) (*Session, []niri.Window, error) {
+func captureOnce(ctx context.Context, client *niri.Client, prefs *preferences.Preferences) (*Session, []niri.Window, error) {
 	niriWorkspaces, err := client.Workspaces(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading workspaces: %w", err)
@@ -318,6 +331,16 @@ func captureOnce(ctx context.Context, client *niri.Client) (*Session, []niri.Win
 			if win.AppID == nil || *win.AppID == "" {
 				// Skip windows with no app_id at all -- Phase 1 showed us
 				// these are typically transient system popups.
+				continue
+			}
+			if prefs.IsAppIgnored(*win.AppID) {
+				// Capture-time exclusion, deliberately the ONLY place this
+				// is enforced (not also re-checked at restore) -- keeps
+				// the check to one pass over the window list rather than
+				// repeating it, and means an app added to the ignore list
+				// after an old capture naturally drops out of the file on
+				// the very next capture, with no separate cleanup logic
+				// needed.
 				continue
 			}
 			var key int64
