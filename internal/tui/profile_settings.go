@@ -99,9 +99,9 @@ func NewModel() (Model, error) {
 		prefs:     prefs,
 		prefsPath: prefsPath,
 		menuItems: []string{
-			"Default Monitor",
-			"Ignore Apps",
-			"Manage Disconnected Outputs",
+			"🖥️  Default Monitor",
+			"🚫 Ignore Apps",
+			"🔌 Manage Disconnected Outputs",
 		},
 	}, nil
 }
@@ -646,137 +646,112 @@ func (m Model) View() string {
 		body = m.viewMainMenu()
 	}
 	if m.err != nil {
-		body += fmt.Sprintf("\nerror: %v\n", m.err)
+		body += "\n" + styleError.Render(fmt.Sprintf("✗ error: %v", m.err)) + "\n"
 	}
-	return body
+	return renderCanvas(body)
 }
 
 func (m Model) viewMainMenu() string {
-	s := "Continuum-WM Profile Settings\n\n"
+	s := styleTitle.Render("Continuum-WM Profile Settings") + "\n\n"
 	for i, item := range m.menuItems {
-		cursor := "  "
-		if i == m.menuCursor {
-			cursor = "> "
-		}
-		s += fmt.Sprintf("%s%s\n", cursor, item)
+		s += renderRow(item, i == m.menuCursor) + "\n"
 	}
 	if m.statusMsg != "" {
-		s += "\n" + m.statusMsg + "\n"
+		s += "\n" + styledStatus(m.statusMsg) + "\n"
 	}
-	s += "\n(up/down to move, enter to select, q to quit)\n"
+	s += "\n" + styleFooter.Render("(up/down to move, enter to select, q to quit)") + "\n"
 	return s
 }
 
 func (m Model) viewDefaultMonitor() string {
-	s := "Default Monitor\n\n"
+	s := styleTitle.Render("🖥️  Default Monitor") + "\n\n"
 	if len(m.connectedOutputs) == 0 {
-		s += "  (no outputs detected -- is niri running?)\n"
+		s += styleMuted.Render("  (no outputs detected -- is niri running?)") + "\n"
 	}
 	for i, o := range m.connectedOutputs {
-		cursor := "  "
-		if i == m.monitorCursor {
-			cursor = "> "
-		}
 		label := o
 		switch {
 		case o == m.prefs.DefaultOutput:
-			label += "  [currently set]"
+			label += styleMuted.Render("  [currently set]")
 		case o == m.autoDetected:
-			label += "  (auto-detected default)"
+			label += styleMuted.Render("  (auto-detected default)")
 		}
-		s += fmt.Sprintf("%s%s\n", cursor, label)
+		s += renderRow(label, i == m.monitorCursor) + "\n"
 	}
-	s += "\n(up/down to move, enter to save selection, esc to go back)\n"
+	s += "\n" + styleFooter.Render("(up/down to move, enter to save selection, esc to go back)") + "\n"
 	return s
 }
 
 func (m Model) viewIgnoreApps() string {
-	s := "Ignore Apps\n\n"
+	s := styleTitle.Render("🚫 Ignore Apps") + "\n\n"
 	if len(m.prefs.IgnoreApps) == 0 {
-		s += "  (none ignored yet)\n"
+		s += styleMuted.Render("  (none ignored yet)") + "\n"
 	}
 	for i, a := range m.prefs.IgnoreApps {
-		cursor := "  "
-		if i == m.ignoreCursor {
-			cursor = "> "
-		}
-		s += fmt.Sprintf("%s%s\n", cursor, a)
+		s += renderRow(a, i == m.ignoreCursor) + "\n"
 	}
 	if m.statusMsg != "" {
-		s += "\n" + m.statusMsg + "\n"
+		s += "\n" + styledStatus(m.statusMsg) + "\n"
 	}
-	s += "\n(up/down to move, 'a' to add, 'd' to remove selected, esc to go back)\n"
+	s += "\n" + styleFooter.Render("(up/down to move, 'a' to add, 'd' to remove selected, esc to go back)") + "\n"
 	return s
 }
 
 func (m Model) viewIgnoreAppsAdd() string {
 	if m.addTextInputActive {
 		if m.addConfirming {
-			s := fmt.Sprintf("No exact match for %q.\n\n", m.addTextBuffer)
+			s := styleTitle.Render(fmt.Sprintf("No exact match for %q", m.addTextBuffer)) + "\n\n"
 			if len(m.addSuggestions) > 0 {
 				s += "Did you mean one of these?\n\n"
 				for i, sug := range m.addSuggestions {
-					cursor := "  "
-					if i == m.addSuggestCursor {
-						cursor = "> "
-					}
-					s += fmt.Sprintf("%s%s\n", cursor, sug)
+					s += renderRow(sug, i == m.addSuggestCursor) + "\n"
 				}
-				s += "\n(up/down to move, enter to add selected)\n"
+				s += "\n" + styleFooter.Render("(up/down to move, enter to add selected)") + "\n"
 			}
-			s += fmt.Sprintf("\n  [r] open the app, then refresh and check again\n  [y] add %q anyway (not currently running)\n  [esc] cancel\n", m.addTextBuffer)
+			s += styleWarning.Render(fmt.Sprintf("\n  ⚠ [r] open the app, then refresh and check again\n  [y] add %q anyway (not currently running)\n  [esc] cancel\n", m.addTextBuffer))
 			if m.statusMsg != "" {
-				s += "\n" + m.statusMsg + "\n"
+				s += "\n" + styledStatus(m.statusMsg) + "\n"
 			}
 			return s
 		}
-		return fmt.Sprintf("Add Ignored App -- type an app_id\n\n> %s\u2588\n\n(enter to confirm, esc to cancel)\n", m.addTextBuffer)
+		return fmt.Sprintf("%s\n\n> %s\u2588\n\n%s\n",
+			styleTitle.Render("➕ Add Ignored App -- type an app_id"),
+			m.addTextBuffer,
+			styleFooter.Render("(enter to confirm, esc to cancel)"))
 	}
 
-	s := "Add Ignored App\n\n"
+	s := styleTitle.Render("➕ Add Ignored App") + "\n\n"
 	if len(m.addCandidates) == 0 {
-		s += "  (no other running apps found)\n"
+		s += styleMuted.Render("  (no other running apps found)") + "\n"
 	}
 	for i, c := range m.addCandidates {
-		cursor := "  "
-		if i == m.addCursor {
-			cursor = "> "
-		}
-		s += fmt.Sprintf("%s%s\n", cursor, c)
+		s += renderRow(c, i == m.addCursor) + "\n"
 	}
-	customCursor := "  "
-	if m.addCursor == len(m.addCandidates) {
-		customCursor = "> "
-	}
-	s += fmt.Sprintf("%sType a custom app_id...\n", customCursor)
-	s += "\n(up/down to move, enter to select, esc to go back)\n"
+	s += renderRow("Type a custom app_id...", m.addCursor == len(m.addCandidates)) + "\n"
+	s += "\n" + styleFooter.Render("(up/down to move, enter to select, esc to go back)") + "\n"
 	return s
 }
 
 func (m Model) viewDisconnectedOutputs() string {
 	if m.confirmForget {
 		target := m.disconnectedOutputs[m.disconnectedCursor]
-		return fmt.Sprintf(
-			"Forget output %q?\n\nThis permanently deletes %d saved entit(y/ies) for this output.\nThis cannot be undone.\n\n  [y] confirm\n  [n/esc] cancel\n",
+		return styleWarning.Render(fmt.Sprintf(
+			"⚠ Forget output %q?\n\nThis permanently deletes %d saved entit(y/ies) for this output.\nThis cannot be undone.\n\n  [y] confirm\n  [n/esc] cancel\n",
 			target.Name, target.EntityCount,
-		)
+		))
 	}
 
-	s := "Manage Disconnected Outputs\n\n"
+	s := styleTitle.Render("🔌 Manage Disconnected Outputs") + "\n\n"
 	if len(m.disconnectedOutputs) == 0 {
-		s += "  (nothing to manage -- no saved entities reference a currently-disconnected output)\n"
+		s += styleMuted.Render("  (nothing to manage -- no saved entities reference a currently-disconnected output)") + "\n"
 	}
 	for i, o := range m.disconnectedOutputs {
-		cursor := "  "
-		if i == m.disconnectedCursor {
-			cursor = "> "
-		}
-		s += fmt.Sprintf("%s%s: %d entit(y/ies)\n", cursor, o.Name, o.EntityCount)
+		s += renderRow(fmt.Sprintf("%s: %d entit(y/ies)", o.Name, o.EntityCount), i == m.disconnectedCursor) + "\n"
 	}
 	if m.statusMsg != "" {
-		s += "\n" + m.statusMsg + "\n"
+		s += "\n" + styledStatus(m.statusMsg) + "\n"
 	}
-	s += "\n(up/down to move, 'f' to forget selected, esc to go back)\n"
+	s += "\n" + styleFooter.Render("(up/down to move, 'f' to forget selected, esc to go back)") + "\n"
 	return s
 }
 
