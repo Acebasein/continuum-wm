@@ -24,7 +24,7 @@ import "time"
 // IN IT -- not a per-window property. A flat entity list had no way to
 // represent that correctly. Old (v1) session files are correctly rejected
 // by Load() rather than silently misread under the new shape.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // Session is the root of a saved Continuum-WM session.
 type Session struct {
@@ -34,7 +34,63 @@ type Session struct {
 	UpdatedAt     time.Time `yaml:"updated_at"`
 	Compositor    string    `yaml:"compositor"`
 
+	// Monitors is the persistent-monitor-identity registry (schema v3+).
+	// Each Workspace references one of these by MonitorID rather than
+	// relying on OutputHint (the volatile connector name) as identity --
+	// see MonitorIdentity's doc comment for why this distinction is
+	// necessary. Deduplicated: one entry per physical monitor, however
+	// many workspaces reference it.
+	Monitors []Monitor `yaml:"monitors,omitempty"`
+
 	Workspaces []Workspace `yaml:"workspaces"`
+}
+
+// MonitorIdentity is hardware evidence for a physical monitor -- CONFIRMED
+// via direct testing that a connector name (e.g. "eDP-1") is NOT stable
+// identity: it changed even WITHIN a single boot, not just across
+// separate reboots, on this project's own test hardware (a real
+// desktop-shell/niri startup race). This is what must actually be
+// persisted and matched against on restore; the connector name is
+// diagnostic-only (see Workspace.OutputHint's updated doc comment).
+type MonitorIdentity struct {
+	Make  string `yaml:"make"`
+	Model string `yaml:"model"`
+
+	// Serial is the strongest identity signal when available, but is
+	// often null -- confirmed directly: this project's own internal
+	// laptop panel reports no serial at all, while its external monitor
+	// does. A nil Serial means "unavailable," not "empty string" -- never
+	// treat a missing serial as if it were a real, matchable value.
+	Serial *string `yaml:"serial,omitempty"`
+
+	// PhysicalWidthMM/PhysicalHeightMM are supporting evidence, used
+	// alongside Make+Model when Serial is unavailable (see the design
+	// doc's matching-priority ordering: serial first, then
+	// make+model+physical-size, with connector class only ever as weak
+	// supporting evidence, never primary identity).
+	PhysicalWidthMM  int `yaml:"physical_width_mm"`
+	PhysicalHeightMM int `yaml:"physical_height_mm"`
+}
+
+// Monitor is one persisted physical monitor entry.
+type Monitor struct {
+	// PersistentID is OUR identity for this monitor, generated once at
+	// first capture -- same pattern as every other PersistentID in this
+	// schema, never derived from niri's own (volatile) connector name.
+	PersistentID string `yaml:"persistent_id"`
+
+	Identity MonitorIdentity `yaml:"identity"`
+
+	// CapturedConnector, LogicalWidth/Height, and Scale are
+	// capture-time-only diagnostic/configuration data -- useful for logs
+	// and as weak supporting evidence, but NEVER trusted as durable
+	// identity on their own. Connector names in particular are expected
+	// to potentially differ at restore time; that's the entire reason
+	// Identity above exists as a separate, hardware-backed field.
+	CapturedConnector string  `yaml:"captured_connector,omitempty"`
+	LogicalWidth      int     `yaml:"logical_width,omitempty"`
+	LogicalHeight     int     `yaml:"logical_height,omitempty"`
+	Scale             float64 `yaml:"scale,omitempty"`
 }
 
 // Workspace is one saved workspace and the entities (windows) it contains.
@@ -43,9 +99,23 @@ type Workspace struct {
 	// first capture. Never derived from niri's own workspace id.
 	PersistentID string `yaml:"persistent_id"`
 
-	// OutputHint is best-effort ("which monitor was this on") -- see the
-	// design doc's note that monitor configuration can change between
-	// sessions, so this is a hint for restore, not a guarantee.
+	// MonitorID references a Monitor.PersistentID above (schema v3+) --
+	// THIS is the real, durable link from a workspace to its physical
+	// monitor. Resolving MonitorID to a CURRENT live connector name is
+	// the Niri adapter's job at restore time (see the persistent-monitor-
+	// identity design doc), not something the core schema does itself.
+	MonitorID string `yaml:"monitor_id,omitempty"`
+
+	// OutputHint is the connector name AT CAPTURE TIME -- diagnostic and
+	// weak supporting evidence ONLY as of schema v3. CONFIRMED VIA DIRECT
+	// TESTING that this can change even within a single boot, not just
+	// across separate reboots -- never treat this as durable identity.
+	// MonitorID above is the real, durable reference; this field remains
+	// for logging/diagnostics and as a fallback when MonitorID is empty
+	// (e.g. a v2 file loaded before the monitor-identity work landed --
+	// though schema version mismatches are rejected outright, so this
+	// fallback only matters for values invented during the v2->v3
+	// transition itself).
 	OutputHint string `yaml:"output_hint,omitempty"`
 
 	// IdxHint is the workspace's position (1-based) on its output at

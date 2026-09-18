@@ -442,25 +442,51 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 	// launch anything new -- just keep observing, since the app may
 	// simply need more time. Only launch a genuinely new process if the
 	// original one has actually exited.
+	// FIXED via real testing: previously both attempts used the exact SAME
+	// timeout. Confirmed directly across real trace data that nearly
+	// every entity, every time, timed out on attempt 1 before succeeding
+	// on attempt 2 just a few seconds later -- meaning the "safety net"
+	// retry had quietly become the GUARANTEED path for every restore,
+	// wasting a full attempt-1 timeout on nearly every single entity.
+	// Rebalanced: attempt 1 gets a LONGER window (most real launches
+	// should now succeed within it directly, with no retry needed at
+	// all), attempt 2 keeps a SHORTER window, since it's now genuinely
+	// the exceptional case -- either a rarer slow launch, or a
+	// crash-recovery relaunch via processAlive (see
+	// attemptLaunchAndObserve's doc comment, which this rebalancing does
+	// NOT change or remove). The COMBINED ceiling is kept at least as
+	// generous as before (previously timeout*2), so nothing that
+	// currently succeeds within the old combined window should regress.
+	attempt1Timeout := timeout + 5*time.Second
+	attempt2Timeout := timeout - 2*time.Second
+	if attempt2Timeout < 5*time.Second {
+		attempt2Timeout = 5 * time.Second
+	}
+
 	const maxAttempts = 2
 	var candidates []uint64
 	var lastErr error
 	var launchedPID int32
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptTimeout := attempt1Timeout
+		if attempt > 1 {
+			attemptTimeout = attempt2Timeout
+		}
+
 		skipLaunch := attempt > 1 && launchedPID != 0 && processAlive(launchedPID)
 		if skipLaunch {
 			fmt.Printf("  attempt %d: original process (pid=%d) is still running -- waiting longer instead of relaunching\n", attempt, launchedPID)
 		}
 
 		var err error
-		candidates, launchedPID, err = attemptLaunchAndObserve(ctx, client, ent, timeout, skipLaunch, launchedPID)
+		candidates, launchedPID, err = attemptLaunchAndObserve(ctx, client, ent, attemptTimeout, skipLaunch, launchedPID)
 		if err == nil {
 			lastErr = nil
 			break
 		}
 		lastErr = err
 		if attempt < maxAttempts && strings.Contains(err.Error(), "timed out") {
-			fmt.Printf("  attempt %d timed out waiting for app_id=%q -- retrying\n", attempt, ent.AppID)
+			fmt.Printf("  attempt %d timed out after %s waiting for app_id=%q -- retrying\n", attempt, attemptTimeout, ent.AppID)
 			continue
 		}
 		break // non-timeout failure, or out of retries -- give up
@@ -571,6 +597,20 @@ func Entity(ctx context.Context, client *niri.Client, ent session.Entity, worksp
 			NiriWindowID: matchedID,
 		}
 	}
+
+	// FIXED BUG, confirmed via real testing (twice, in two independent
+	// clean reboot tests, both under real system load with other startup
+	// processes competing for resources): verifying placement
+	// IMMEDIATELY after issuing the move, with zero settle time, produced
+	// a false "window exists but is not on the expected workspace"
+	// result even though the move itself was fine -- niri simply hadn't
+	// finished processing it yet by the time we re-queried. This is the
+	// same class of timing issue Phase 7's width/height correction logic
+	// already had to account for (niri operations aren't always
+	// instantaneous, especially under real load), just never applied to
+	// this earlier, more fundamental placement-verification step before
+	// now.
+	time.Sleep(200 * time.Millisecond)
 
 	// --- VERIFYING ---
 	// Re-query live state and confirm the window ended up on a workspace

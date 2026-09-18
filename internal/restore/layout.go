@@ -124,6 +124,81 @@ func columnIndexOf(ctx context.Context, client *niri.Client, windowID uint64) (u
 	return 0, false
 }
 
+// waitForMergedColumnSettle actively polls until every successfully-
+// matched entity in col reports the SAME live column index -- i.e. the
+// merge has genuinely taken effect geometrically -- rather than trusting
+// a fixed delay. See ApplyColumnLayout's settle-delay comment for the
+// full reasoning on why this exists specifically for multi-entity
+// columns.
+//
+// Bounded, never blocks indefinitely: gives up and proceeds anyway after
+// maxMergeSettleWait, same as the old fixed-delay behavior would have --
+// this is never WORSE than the previous approach on a slow/stuck case,
+// just adaptive (and typically faster) on a normal one.
+func waitForMergedColumnSettle(ctx context.Context, client *niri.Client, col session.Column, results []Result) {
+	if len(col.Entities) < 2 {
+		return // nothing merged, nothing to verify
+	}
+
+	var matchedIDs []uint64
+	for _, r := range results {
+		if r.NiriWindowID != 0 {
+			matchedIDs = append(matchedIDs, r.NiriWindowID)
+		}
+	}
+	if len(matchedIDs) < 2 {
+		return // fewer than 2 real windows -- no merge geometry to verify
+	}
+
+	const pollInterval = 150 * time.Millisecond
+	const maxMergeSettleWait = 1500 * time.Millisecond
+	deadline := time.Now().Add(maxMergeSettleWait)
+
+	for {
+		// One client.Windows() call per poll, checked against every
+		// matched ID -- deliberately not calling columnIndexOf per ID,
+		// since that would re-fetch the full window list once per ID per
+		// poll for no benefit (client.Windows() already returns
+		// everything in one call).
+		wins, err := client.Windows(ctx)
+		if err == nil {
+			colByID := make(map[uint64]uint64, len(matchedIDs))
+			for _, w := range wins {
+				if w.Layout != nil && w.Layout.PosInScrollingLayout != nil {
+					colByID[w.ID] = w.Layout.PosInScrollingLayout[0]
+				}
+			}
+			allMatch := true
+			var firstCol uint64
+			firstSet := false
+			for _, id := range matchedIDs {
+				idx, ok := colByID[id]
+				if !ok {
+					allMatch = false
+					break
+				}
+				if !firstSet {
+					firstCol = idx
+					firstSet = true
+					continue
+				}
+				if idx != firstCol {
+					allMatch = false
+					break
+				}
+			}
+			if allMatch {
+				return // converged -- geometry should now reflect the merge
+			}
+		}
+		if time.Now().After(deadline) {
+			fmt.Println("  (merged column did not fully settle within the wait budget -- proceeding with sizing anyway)")
+			return
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
 // ApplyColumnLayout applies Phase 7 layout restoration -- column width
 // (once per column) and per-entity height -- AFTER every entity in the
 // column has already been reconciled/restored via Reconcile, AND after
@@ -183,19 +258,29 @@ func ApplyColumnLayout(ctx context.Context, client *niri.Client, col session.Col
 		}
 	}
 
-	// Brief settle delay before touching layout at all. CONFIRMED via real
-	// testing: a freshly-launched, slow-starting app's window can be
-	// successfully MATCHED (it exists, has the right app_id) before niri's
-	// own layout engine has fully settled it into its final column shape
-	// -- issuing a resize immediately can land on that transient state and
-	// get silently overwritten moments later once the app finishes
-	// initializing. Observed intermittently, always on heavy/slow apps
-	// (Firefox in one test run, Chrome in another) -- consistent with a
-	// timing race, not a deterministic bug. This delay is a pragmatic
-	// mitigation, not a proven complete fix; worth revisiting if it still
-	// happens occasionally.
-	const preLayoutSettleDelay = 300 * time.Millisecond
-	time.Sleep(preLayoutSettleDelay)
+	// Settle delay before touching layout at all. CONFIRMED via real
+	// testing: for a SOLO-entity column (nothing to merge), a fixed brief
+	// delay is enough -- this is about a freshly-launched, slow-starting
+	// app's window not having fully settled into its final shape yet.
+	//
+	// For a MULTI-entity column, a fixed delay is NOT reliable enough:
+	// CONFIRMED via real testing that MergeColumnTopology's own success
+	// check (column INDEX equality) can become true before the actual
+	// GEOMETRIC reflow (width/height redistribution between the merged
+	// windows) has caught up -- confirmed directly: a merged column's
+	// width/height measurements matched niri's PRE-merge defaults (an
+	// even 2-column split for width, a solo full-height ceiling for
+	// height) rather than genuinely post-merge values, even though the
+	// merge's own topology check had already reported success moments
+	// earlier. So multi-entity columns get an ADAPTIVE wait instead,
+	// actively polling until geometry actually reflects the merge -- see
+	// waitForMergedColumnSettle.
+	if len(col.Entities) > 1 {
+		waitForMergedColumnSettle(ctx, client, col, results)
+	} else {
+		const preLayoutSettleDelay = 300 * time.Millisecond
+		time.Sleep(preLayoutSettleDelay)
+	}
 
 	// --- WIDTH (once per column) ---
 	if col.WidthFraction != nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 )
 
 // Client talks to niri exclusively via the `niri msg` CLI wrapper around
@@ -33,9 +34,30 @@ func (c *Client) bin() string {
 // JSON is an OBJECT keyed by output name (e.g. {"eDP-2": {...}}), not an
 // array like Workspaces/Windows -- different shape, handled accordingly
 // in Outputs() below.
+// Output is niri's own reported state for one display output.
+//
+// Name is the CURRENT, VOLATILE connector name (e.g. "eDP-1", "eDP-2") --
+// confirmed via direct testing that this can change even WITHIN a single
+// boot on some hardware/desktop-shell combinations, not just across
+// separate reboots. Per the persistent-monitor-identity design, Name must
+// never be treated as a durable identity by callers -- it's a
+// current-session routing handle only. The Make/Model/Serial/
+// PhysicalWidthMM/PhysicalHeightMM fields below are what should actually
+// be persisted as identity evidence; Name is diagnostic/runtime-only.
 type Output struct {
 	Name    string         `json:"name"`
 	Logical *LogicalRegion `json:"logical"`
+
+	// Hardware identity evidence -- see MonitorIdentity in the session
+	// package for how these get persisted and matched against on restore.
+	Make   string  `json:"make"`
+	Model  string  `json:"model"`
+	Serial *string `json:"serial"` // often null, esp. on internal laptop panels -- confirmed directly on this project's own test hardware
+
+	// PhysicalSizeMM is [width, height] in millimeters, as niri reports
+	// it -- used as supporting identity evidence when Serial is
+	// unavailable (see the design doc's matching-priority discussion).
+	PhysicalSizeMM [2]int `json:"physical_size"`
 }
 
 // LogicalRegion is an output's logical (post-scale) position and size --
@@ -284,15 +306,35 @@ func LaunchDetached(command []string, workDir string) (pid int32, err error) {
 		// last resort, rather than failing the whole launch over it.
 	}
 
-	wrapped := append([]string{"setsid", "--fork", "--"}, command...)
-	cmd := exec.Command(wrapped[0], wrapped[1:]...)
+	// CONFIRMED BUG, fixed here: this previously wrapped the target
+	// command in an external `setsid --fork --` invocation and returned
+	// THAT process's PID. setsid --fork's documented behavior is to fork
+	// a NEW child (which becomes the session leader and execs the real
+	// target), while the ORIGINAL setsid invocation -- whose PID was
+	// being captured and returned here -- exits almost immediately once
+	// the fork succeeds. This meant the PID our retry-duplication logic
+	// checked for liveness (restore.go's processAlive) was essentially
+	// guaranteed to already be dead moments after a successful launch,
+	// completely independent of whether the real application was still
+	// alive and simply slow -- confirmed as the root cause of duplicate
+	// windows appearing under real load (a fresh reboot, several apps
+	// starting at once).
+	//
+	// Fixed by using Go's own SysProcAttr.Setsid instead of an external
+	// setsid binary: achieves the same session-detachment originally
+	// needed (confirmed necessary so bubblewrap's --die-with-parent
+	// doesn't kill ONLYOFFICE when continuum-cli exits) WITHOUT an
+	// intermediate fork-and-exit process muddying the PID. cmd.Process.Pid
+	// now tracks the actual launched command -- and any further
+	// exec-based wrapper scripts (e.g. NixOS's own app wrappers, which
+	// preserve PID across exec; only fork() changes PID, and a
+	// conventional `exec real-binary "$@"` wrapper never forks).
+	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Dir = workDir
-	// No SysProcAttr.Setsid here -- `setsid --fork` already handles full
-	// session detachment; adding our own on top is redundant at best and
-	// avoided for clarity, not because it was confirmed harmful.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("starting %v: %w", command, err)

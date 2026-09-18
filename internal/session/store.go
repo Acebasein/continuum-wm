@@ -259,6 +259,43 @@ func captureOnce(ctx context.Context, client *niri.Client, prefs *preferences.Pr
 		Compositor:    "niri",
 	}
 
+	// Build the Monitors registry from live output data (schema v3+).
+	// Fresh persistent IDs every capture -- consistent with how every
+	// other entity/workspace ID already works for a plain capture (no
+	// cross-capture ID stability is attempted here; that's specifically
+	// the auto-capture MERGE path's job, via monitor.Resolve, not this
+	// one-shot capture path). The conversion from niri.Output to
+	// session.MonitorIdentity is done inline here, deliberately NOT via a
+	// shared helper in internal/monitor -- that package already imports
+	// internal/session (for MonitorIdentity itself), so this package
+	// importing internal/monitor back would create an import cycle.
+	monitorIDByConnector := make(map[string]string, len(niriOutputs))
+	var monitors []Monitor
+	for connector, o := range niriOutputs {
+		id := idgen.New("mon")
+		monitorIDByConnector[connector] = id
+		m := Monitor{
+			PersistentID: id,
+			Identity: MonitorIdentity{
+				Make:   o.Make,
+				Model:  o.Model,
+				Serial: o.Serial,
+			},
+			CapturedConnector: connector,
+		}
+		if o.PhysicalSizeMM[0] > 0 || o.PhysicalSizeMM[1] > 0 {
+			m.Identity.PhysicalWidthMM = o.PhysicalSizeMM[0]
+			m.Identity.PhysicalHeightMM = o.PhysicalSizeMM[1]
+		}
+		if o.Logical != nil {
+			m.LogicalWidth = o.Logical.Width
+			m.LogicalHeight = o.Logical.Height
+			m.Scale = o.Logical.Scale
+		}
+		monitors = append(monitors, m)
+	}
+	s.Monitors = monitors
+
 	validWorkspaceIDs := make(map[uint64]bool, len(niriWorkspaces))
 	for _, nw := range niriWorkspaces {
 		validWorkspaceIDs[nw.ID] = true
@@ -299,6 +336,7 @@ func captureOnce(ctx context.Context, client *niri.Client, prefs *preferences.Pr
 		}
 		if nw.Output != nil {
 			ws.OutputHint = *nw.Output
+			ws.MonitorID = monitorIDByConnector[ws.OutputHint]
 		}
 
 		// Look up this workspace's output logical dimensions, once, for
