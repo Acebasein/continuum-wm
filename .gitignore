@@ -1,5 +1,7 @@
-continuum-observe
-continuum-cli
+/continuum-observe
+/continuum-cli
 *-test*.yaml
 *.yaml.previous
 pre-reboot.yaml
+phase7-scratch.yaml
+*-scratch.yaml

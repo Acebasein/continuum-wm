@@ -124,12 +124,31 @@ func columnIndexOf(ctx context.Context, client *niri.Client, windowID uint64) (u
 	return 0, false
 }
 
+// mergeWidthSettleToleranceLogicalPx: how far apart (in logical pixels)
+// two windows' tile_size[0] in the same column are allowed to be and
+// still be considered "settled" for merge-geometry purposes. Column
+// width is SHARED across every window in a column, so once niri has
+// truly finished reflowing a merge, matched windows should read back
+// (near-)identical widths -- this isn't the same tolerance as
+// layoutCorrectionTolerance (which is a fraction of output width, used
+// to decide whether a correction request is worth issuing); this one is
+// just checking "have these two numbers converged with each other yet",
+// so a small fixed pixel epsilon is more appropriate than a fraction.
+const mergeWidthSettleToleranceLogicalPx = 1.0
+
 // waitForMergedColumnSettle actively polls until every successfully-
-// matched entity in col reports the SAME live column index -- i.e. the
-// merge has genuinely taken effect geometrically -- rather than trusting
-// a fixed delay. See ApplyColumnLayout's settle-delay comment for the
-// full reasoning on why this exists specifically for multi-entity
-// columns.
+// matched entity in col reports BOTH the same live column index AND the
+// same tile_size width -- i.e. the merge has genuinely taken effect
+// geometrically, not just topologically -- rather than trusting a fixed
+// delay. See ApplyColumnLayout's settle-delay comment for the full
+// reasoning on why this exists specifically for multi-entity columns.
+//
+// CONFIRMED via real testing: column-index equality alone is not
+// sufficient -- a merge can report matching column indices while the
+// FIRST entity's tile_size[0] still reads back niri's pre-merge default
+// (e.g. an even 2-column split) for one more poll cycle before the
+// actual width reflow catches up. Checking both conditions closes that
+// gap.
 //
 // Bounded, never blocks indefinitely: gives up and proceeds anyway after
 // maxMergeSettleWait, same as the old fixed-delay behavior would have --
@@ -163,22 +182,27 @@ func waitForMergedColumnSettle(ctx context.Context, client *niri.Client, col ses
 		wins, err := client.Windows(ctx)
 		if err == nil {
 			colByID := make(map[uint64]uint64, len(matchedIDs))
+			widthByID := make(map[uint64]float64, len(matchedIDs))
 			for _, w := range wins {
 				if w.Layout != nil && w.Layout.PosInScrollingLayout != nil {
 					colByID[w.ID] = w.Layout.PosInScrollingLayout[0]
+					widthByID[w.ID] = w.Layout.TileSize[0]
 				}
 			}
 			allMatch := true
 			var firstCol uint64
+			var firstWidth float64
 			firstSet := false
 			for _, id := range matchedIDs {
-				idx, ok := colByID[id]
-				if !ok {
+				idx, idxOK := colByID[id]
+				width, widthOK := widthByID[id]
+				if !idxOK || !widthOK {
 					allMatch = false
 					break
 				}
 				if !firstSet {
 					firstCol = idx
+					firstWidth = width
 					firstSet = true
 					continue
 				}
@@ -186,9 +210,13 @@ func waitForMergedColumnSettle(ctx context.Context, client *niri.Client, col ses
 					allMatch = false
 					break
 				}
+				if absFloat(width-firstWidth) > mergeWidthSettleToleranceLogicalPx {
+					allMatch = false
+					break
+				}
 			}
 			if allMatch {
-				return // converged -- geometry should now reflect the merge
+				return // converged -- both column index and width now reflect the merge
 			}
 		}
 		if time.Now().After(deadline) {
